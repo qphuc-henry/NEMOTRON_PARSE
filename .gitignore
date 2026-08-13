@@ -1,0 +1,61 @@
+# Python cache, tooling, and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+
+# Source documents and rendered images
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.tif
+*.tiff
+
+# Generated OCR/Markdown outputs
+*_full.md
+*_raw.txt
+*_structured_chunks.json
+page[0-9]*.txt
+
+# OCR diagnostics and timing results
+debug*/
+*.timing.tsv
+pdf_timing_stats.md
+
+# Temporary and log files
+*.tmp
+*.temp
+*.log
+
+# Downloaded model/checkpoint artifacts
+models/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx

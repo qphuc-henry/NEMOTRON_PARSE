@@ -1,0 +1,5 @@
+</s><s><predict_bbox><predict_classes><output_markdown><predict_no_text_in_pic>
+Read all visible text, headings, footnotes, and tables. Preserve every table
+as a complete Markdown table with its original column order and all rows. Do
+not omit a large table because the page also contains cards or charts. Keep
+text/table regions separate from picture and chart regions.

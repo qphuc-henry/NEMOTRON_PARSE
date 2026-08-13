@@ -1,0 +1,54 @@
+Bạn là trợ lý phân tích tài liệu. Chỉ sử dụng thông tin trong các chunks dưới đây.
+Nếu thiếu dữ liệu, hãy nói rõ là không tìm thấy trong tài liệu.
+Luôn ghi số trang và loại chunk khi trích dẫn.
+
+CÂU HỎI:
+Báo cáo ngành công nghệ dự báo gì cho năm 2026? Hãy nêu số liệu và dẫn trang.
+
+STRUCTURED CHUNKS:
+
+[Trang 2 | Section-header | order=0 | bbox=[0.0, 0.0, 0.7666, 0.3094]]
+Chi tiêu CNTT toàn cầu dự kiến tăng 14,2% trong năm 2026
+
+[Trang 2 | List-item | order=1 | bbox=[0.0361, 0.3203, 0.9629, 0.3594]]
+• Theo Gartner, tổng chi tiêu CNTT toàn cầu dự kiến đạt 6,37 nghìn tỷ USD vào năm 2026, tăng 14,2% so với năm trước. Ðộng lực chính đển từ làn sóng đầu tư vào hạ tằng AI và phãn mèm, trong bối cảnh nhu cầu xử lý các tác vụ AI tiếp tục mở rộng nhanh chóng trên toàn cầu. Đáng chú ý, chi tiêu AI được dự báo tăng trưởng với CAGR khoẳng 40,7% trong giai đoạn 2025–2027.
+
+[Trang 2 | List-item | order=2 | bbox=[0.0361, 0.3617, 0.9639, 0.4266]]
+• Trung tâm dữ liệu (TTDL) là phân khúc tăng nhanh nhất nhờ đầu tư mạnh vào máy chủ, GPU và bộ nhớ hiệu năng cao. Dịch vụ CNTT duy trì quy mô lớn nhất, trong khi phãn mèm được thúc đẩy bởi GenAI. Ngược lại, thiết bị và viễn thông tăng trưởng chậm hơn. Xu hưởng này cho thấy dòng vốn đang chuyển vào các lính vực có giá trị gia tăng cao. Mặc dù doanh nghiệp Việt Nam hiện vẫn tập trung chủ yếu vào gia công phãn mèm và dịch vụ viễn thông, tuy nhiên các tập đoàn lớn như FPT, Viettel, VNPT và CMC đang từng bước chuyển sang chu kỳ đầu tư dài hạn, ưu tiên phát triến hạ tằng số, AI và công nghệ lõi nhẵm nâng cao vị thế trong chuỗi giá trị ICT.
+
+[Trang 2 | List-item | order=3 | bbox=[0.0361, 0.4289, 0.9639, 0.4813]]
+• Theo Bộ KH&CN, doanh thu toàn ngành ICT Việt Nam trong 5T2026 tăng trưởng mạnh, đạt khoắng 2,6 triệu tỷ đồng (+37% YoY), đóng góp khoảng 538 nghìn tỷ đồng vào GDP (+28% YoY) và hoàn thành khoảng 45% ke hoạch năm 2026. Chúng tôi kỳ vọng năm 2026 ngành ICT Việt Nam sẽ tiếp tục tăng trưởng tuy nhiên chậm lại hơn so với năm trước, nhờ vào các động lực: 1) Các chính sách, nghị quyết, luật ưu đấi nhằm thúc đấy đầu tư vào công nghệ và chuyển đổi số; 2) Nhu cầu về AI, điện toán đám mây và TTDL tiếp tục gia tăng.
+
+[Trang 2 | Chart | order=4 | bbox=[0.0342, 0.4898, 0.3584, 0.6977]]
+| Date | Trung tâm dữ liệu | Thiết bị | Phãn mèm | Dịch vụ CNTT | Dịch vụ viễn thông | Tăng trưởng YoY (%) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2021 | 9000 | 1000 | 1000 | 1000 | 1000 | 13.5% |
+| 2022 | 1000 | 1000 | 1000 | 1000 | 0.1% | 0.1% |
+| 2023 | 1000 | 1000 | 1000 | 1000 | 11.3% | 0.1% |
+| 2024 | 1000 | 1000 | 1000 | 1000 | 2.9% | 0.1% |
+| 2025 | 1000 | 1000 | 1000 | 1000 | 10.7% | 0.1% |
+| 2026F | 1000 | 1000 | 1000 | 1000 | 14.2% | 0.1% |
+
+[Trang 2 | Table | order=5 | bbox=[0.3682, 0.4891, 0.6289, 0.6813]]
+\begin{tabular}{ccccc}
+**Chỉ tiêu** & **2025** & **Tăng trưởng (\%)** & **2026F** & **Tăng trưởng (\%)**\\
+Trung tâm dữ liệu & 506,000 & 51.6 & 822,000 & 62.5\\
+Phàn mèm & 790,000 & 9.7 & 868,000 & 9.8\\
+Thiết bị & 1,271,000 & 13.9 & 1,468,000 & 15.5\\
+Dịch vụ CNTT & 1,714,000 & 6.2 & 1,857,000 & 8.3\\
+Dịch vụ viễn thông & 1,296,000 & 3.3 & 1,354,000 & 4.4\\
+Tống cộng & 5,577,000 & 10.7 & 6,369,000 & 14.2\\
+\end{tabular}
+
+[Trang 2 | Chart | order=6 | bbox=[0.6396, 0.4906, 0.9619, 0.6984]]
+| Doanh thu ngành công nghệ Việt Nam (Triệu tỷ VND) | Noanh thu (%) | Tăng trưởng YoY (%) |
+| --- | --- | --- |
+| 2021 | 3.2 | 11.7 |
+| 2022 | 3.4 | 4.4 |
+| 2023 | 3.3 | -1.1 |
+| 2024 | 3.9 | 16.7 |
+| 2025 | 5.2 | 34.0 |
+| 2026F | 5.9 | 14.0 |
+
+[Trang 2 | Page-footer | order=7 | bbox=[0.0322, 0.7, 0.9629, 0.7172]]
+2 | Vietnam macro and stock market Mirae Asset Securities (Vietnam) Research
