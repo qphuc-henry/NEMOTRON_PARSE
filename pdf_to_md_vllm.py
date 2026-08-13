@@ -77,6 +77,7 @@ NUMBER_TOKEN = re.compile(r"(?<![\w])(?:[+\-−–]?\(?\d[\d., ]*\)?%?)")
 VISIBLE_NUMBER_TOKEN = re.compile(r"(?<![\w])(?:[+\-−–]?\(?\d[\d.,]*\)?%?)")
 OCR_CHART_TOKEN = re.compile(
     r"[1-4]Q\d{2,4}|Q[1-4](?:/)?\d{2,4}|(?:6T|9T|H[12]|S[12])\d{2,4}|"
+    r"(?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])[-/.]20\d{2}|"
     r"20\d{2}[-/.](?:0?[1-9]|1[0-2])|(?:0?[1-9]|1[0-2])[-/.]20\d{2}|"
     r"[+\-−–]?\(?\d[\d.,]*\)?(?:%|x)?",
     re.IGNORECASE,
@@ -245,7 +246,10 @@ def parse_segments(raw: str, source: str = "pass1") -> list[Segment]:
 
 def clean_unstructured_output(raw: str) -> str:
     text = clean_generated_text(raw)
-    text = re.sub(r"<x_[\d.]+><y_[\d.]+>", "", text)
+    # Nemotron sometimes emits incomplete bbox fragments such as
+    # ``<x_0.3105>`` around picture-only regions. They are model control
+    # coordinates, never visible chart values.
+    text = re.sub(r"<[xy]_[\d.]+>", "", text)
     return re.sub(r"<class_[^>]+>", "", text).strip()
 
 
@@ -336,14 +340,14 @@ def chart_quality_issues(text: str, context: str = "") -> list[str]:
             bool(re.fullmatch(r"[+\-−–]?\d[\d., ]*%?", cell))
             for cell in first_cells
         )
-        period_first = sum(
-            bool(re.search(
-                r"(?:^|\b)(?:q[1-4]|[1-4]q|6t|9t|fy)?\s*20\d{2}(?:\b|$)|"
-                r"^[1-4]q\d{2}$|^q[1-4]/\d{2,4}$",
-                fold_text(cell), re.IGNORECASE,
-            ))
-            for cell in first_cells
-        )
+        period_first = sum(is_period_label(cell) for cell in first_cells)
+        if (
+            looks_like_time_chart_context(context)
+            and len(data) >= 2
+            and period_first / len(data) < 0.80
+        ):
+            issues.append("non-period categories in a time chart")
+            continue
         scatter_context = "scatter" in fold_text(context)
         if (
             len(data) >= 3 and numeric_first / len(data) >= 0.80
@@ -454,6 +458,115 @@ def chart_ir_from_rows(
     )
 
 
+def transposed_period_chart_ir(text: str, source: str) -> ChartIR | None:
+    """Normalize direct OCR tables whose printed periods run across columns."""
+    for rows in markdown_tables(text):
+        separator = next((
+            i for i, row in enumerate(rows)
+            if row and all(TABLE_SEPARATOR.fullmatch(cell) for cell in row)
+        ), None)
+        if separator is None or separator == 0 or separator + 1 >= len(rows):
+            continue
+        header = rows[separator - 1]
+        period_columns = [
+            index for index, cell in enumerate(header) if is_period_label(cell)
+        ]
+        nonempty_headers = [cell for cell in header if cell.strip()]
+        value_offset = 1 if period_columns and period_columns[0] == 0 else 0
+        if (
+            len(period_columns) < 2
+            or len(period_columns) / max(1, len(nonempty_headers)) < 0.70
+        ):
+            continue
+        series_rows = [
+            row for row in rows[separator + 1:]
+            if row and any(
+                column < len(row) and compact_numeric_label(row[column]) is not None
+                for column in (item + value_offset for item in period_columns)
+            )
+        ]
+        if not series_rows:
+            continue
+        series = tuple(
+            row[0].strip() or f"Chuỗi {index + 1}"
+            for index, row in enumerate(series_rows)
+        )
+        if len(series_rows) == 1:
+            direct_values = [
+                series_rows[0][column + value_offset]
+                for column in period_columns
+                if column + value_offset < len(series_rows[0])
+            ]
+            if direct_values and all("%" in value for value in direct_values):
+                # The row label is frequently shifted from the bar legend in a
+                # transposed OCR table. Use a neutral unit-bearing name rather
+                # than attach correctly read percentages to the wrong series.
+                series = ("Giá trị (%)",)
+        observations: list[ChartObservation] = []
+        categories: list[str] = []
+        for column in period_columns:
+            category = header[column].strip()
+            categories.append(category)
+            for row, series_name in zip(series_rows, series):
+                value_column = column + value_offset
+                if value_column >= len(row):
+                    continue
+                value = compact_numeric_label(row[value_column])
+                if value is not None:
+                    observations.append(ChartObservation(
+                        category, series_name, value, source
+                    ))
+        if len(observations) >= 2:
+            return ChartIR(
+                "Kỳ", series, tuple(categories), tuple(observations), source
+            )
+    return None
+
+
+def combo_raw_chart_candidate(
+    candidate: Segment | None, direct_line: ChartIR | None, context: str
+) -> Segment | None:
+    """Retain single-pass bars while accepting only direct line-label values."""
+    folded = fold_text(context)
+    if not (
+        candidate is not None
+        and markdown_tables(candidate.text)
+        and any(token in folded for token in ("duong", "line", "truc phai"))
+        and any(token in folded for token in ("cot", "bar"))
+    ):
+        return None
+    chart = chart_ir_from_markdown(candidate.text, candidate.source)
+    if chart is None or len(chart.series) < 2:
+        return None
+    line_series = chart.series[-1]
+    observations = [
+        replace(item, source="single_pass_bar")
+        for item in chart.observations if item.series != line_series
+    ]
+    direct_values: dict[str, str] = {}
+    if direct_line is not None:
+        for item in direct_line.observations:
+            direct_values[normalize_text(item.category)] = item.value
+    observations.extend(
+        ChartObservation(
+            category, line_series, direct_values[normalize_text(category)],
+            "direct_line_label",
+        )
+        for category in chart.categories
+        if normalize_text(category) in direct_values
+    )
+    result = ChartIR(
+        chart.category_name, chart.series, chart.categories,
+        tuple(observations), "combo_raw_evidence",
+    )
+    if len(observations) < 2:
+        return None
+    return Segment(
+        candidate.order, "Chart", candidate.bbox, render_chart_ir(result),
+        "combo_raw_evidence", result,
+    )
+
+
 def render_chart_ir(chart: ChartIR) -> str:
     categories = list(dict.fromkeys(chart.categories))
     values = {
@@ -483,11 +596,8 @@ def chart_ir_category_coverage(chart: ChartIR | None) -> float:
 
 
 def numeric_label_fingerprint(token: str) -> str:
-    value = canonical_number(token)
-    percent = "%" if "%" in value else ""
-    sign = "-" if value.startswith("-") else "+" if value.startswith("+") else ""
-    digits = re.sub(r"\D", "", value)
-    return sign + digits + percent
+    """Identity of a printed number, including every meaningful separator."""
+    return canonical_number(token).casefold()
 
 
 def mask_unverified_chart_values(structured: str, evidence: str) -> str:
@@ -536,10 +646,123 @@ def mask_unverified_chart_values(structured: str, evidence: str) -> str:
     return "\n".join(output)
 
 
-def mask_combo_line_without_evidence(structured: str, context: str) -> str:
-    """Withhold line-series cells when no direct label OCR is available."""
+def mask_all_chart_values(structured: str) -> str:
+    """Keep a chart skeleton while removing every unprinted data cell."""
+    output: list[str] = []
+    inside_table = False
+    separator_seen = False
+    for line in structured.splitlines():
+        if not line.lstrip().startswith("|"):
+            inside_table = False
+            separator_seen = False
+            output.append(line)
+            continue
+        cells = split_markdown_row(line)
+        if not inside_table:
+            inside_table = True
+            output.append(line)
+            continue
+        if cells and all(TABLE_SEPARATOR.fullmatch(cell) for cell in cells):
+            separator_seen = True
+            output.append(line)
+            continue
+        if separator_seen:
+            cells = [cells[0], *["—"] * (len(cells) - 1)]
+            output.append(markdown_row(cells))
+        else:
+            output.append(line)
+    return "\n".join(output)
+
+
+def restore_unique_category_separators(structured: str, evidence: str) -> str:
+    """Restore punctuation only for a unique same-category digit match."""
+    evidence_by_category: dict[str, list[str]] = {}
+    for rows in markdown_tables(evidence):
+        separator = next((
+            i for i, row in enumerate(rows)
+            if row and all(TABLE_SEPARATOR.fullmatch(cell) for cell in row)
+        ), None)
+        if separator is None:
+            continue
+        for row in rows[separator + 1:]:
+            if not row:
+                continue
+            evidence_by_category.setdefault(normalize_text(row[0]), []).extend(
+                match.group() for cell in row[1:]
+                for match in VISIBLE_NUMBER_TOKEN.finditer(cell)
+            )
+
+    def punctuationless(token: str) -> str:
+        return re.sub(r"[.,]", "", canonical_number(token)).casefold()
+
+    lines = structured.splitlines()
+    for line_index, line in enumerate(lines):
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = split_markdown_row(line)
+        if len(cells) < 2 or TABLE_SEPARATOR.fullmatch(cells[0]):
+            continue
+        local_evidence = evidence_by_category.get(normalize_text(cells[0]), [])
+        if not local_evidence:
+            continue
+        generated = [
+            (column, match.group())
+            for column, cell in enumerate(cells[1:], start=1)
+            for match in VISIBLE_NUMBER_TOKEN.finditer(cell)
+        ]
+        for column, token in generated:
+            matches = [
+                item for item in local_evidence
+                if punctuationless(item) == punctuationless(token)
+            ]
+            same_row = [
+                item for _, item in generated
+                if punctuationless(item) == punctuationless(token)
+            ]
+            if len(matches) == 1 and len(same_row) == 1:
+                cells[column] = cells[column].replace(token, matches[0], 1)
+        lines[line_index] = markdown_row(cells)
+    return "\n".join(lines)
+
+
+def evidence_bound_chart_candidate(
+    candidate: Segment | None, evidence: Segment | None, context: str
+) -> Segment | None:
+    """Keep only generated table cells reproduced by direct local-label OCR."""
+    if candidate is None or evidence is None or not markdown_tables(candidate.text):
+        return None
+    restored = restore_unique_category_separators(candidate.text, evidence.text)
+    masked = mask_unverified_chart_values(restored, evidence.text)
+    masked = mask_combo_line_without_evidence(masked, context, evidence.text)
+    chart = chart_ir_from_markdown(masked, "evidence_bound", min_data_rows=1)
+    if chart is None or len(chart.observations) < 2:
+        return None
+    folded = fold_text(context)
+    combo = (
+        any(token in folded for token in ("duong", "line", "truc phai"))
+        and any(token in folded for token in ("cot", "bar"))
+    )
+    # A collapsed one-series table cannot tell whether a visible endpoint is a
+    # bar or line value, so exposing it would attach correct digits to the
+    # wrong series (for example 23,3% as revenue).
+    if combo and len(chart.series) < 2:
+        return None
+    if chart_quality_issues(masked, context):
+        return None
+    return replace(
+        candidate, text=masked, source="evidence_bound_table", chart_ir=chart
+    )
+
+
+def mask_combo_line_without_evidence(
+    structured: str, context: str, evidence: str = ""
+) -> str:
+    """Withhold combo-chart line cells lacking direct printed-label OCR."""
     folded_context = fold_text(context)
-    if not any(token in folded_context for token in ("duong", "line", "truc phai")):
+    if not (
+        any(token in folded_context for token in ("duong", "line", "truc phai"))
+        and any(token in folded_context for token in ("cot", "bar"))
+    ):
         return structured
     lines = structured.splitlines()
     table_indexes = [i for i, line in enumerate(lines) if line.lstrip().startswith("|")]
@@ -551,14 +774,27 @@ def mask_combo_line_without_evidence(structured: str, context: str) -> str:
         index for index, cell in enumerate(header[1:], start=1)
         if "%" in cell
     }
+    if not line_columns and len(header) >= 3:
+        line_columns = {len(header) - 1}
     if not line_columns:
         return structured
+    available = Counter(
+        numeric_label_fingerprint(match.group())
+        for match in VISIBLE_NUMBER_TOKEN.finditer(evidence)
+    )
     for line_index in table_indexes[2:]:
         cells = split_markdown_row(lines[line_index])
         if len(cells) != len(header):
             continue
         for column in line_columns:
-            cells[column] = "—"
+            matches = list(VISIBLE_NUMBER_TOKEN.finditer(cells[column]))
+            needed = Counter(
+                numeric_label_fingerprint(match.group()) for match in matches
+            )
+            if not matches or any(available[value] < count for value, count in needed.items()):
+                cells[column] = "—"
+            else:
+                available.subtract(needed)
         lines[line_index] = markdown_row(cells)
     return "\n".join(lines)
 
@@ -567,6 +803,11 @@ def chart_reads_agree(first: str, second: str) -> bool:
     left_ir = chart_ir_from_markdown(first, "read_1")
     right_ir = chart_ir_from_markdown(second, "read_2")
     if left_ir is None or right_ir is None:
+        return False
+    if (
+        chart_ir_category_coverage(left_ir) < 0.95
+        or chart_ir_category_coverage(right_ir) < 0.95
+    ):
         return False
     left = {
         (normalize_text(item.category), normalize_text(item.series)): canonical_number(item.value)
@@ -582,7 +823,7 @@ def chart_reads_agree(first: str, second: str) -> bool:
     key_coverage = len(common_keys) / min(len(left), len(right))
     size_coverage = len(common_keys) / max(len(left), len(right))
     value_agreement = sum(left[key] == right[key] for key in common_keys) / len(common_keys)
-    return key_coverage >= 0.80 and size_coverage >= 0.75 and value_agreement >= 0.90
+    return key_coverage == 1.0 and size_coverage == 1.0 and value_agreement == 1.0
 
 
 def keyed_numeric_cell_agreement(first: str, second: str) -> float:
@@ -659,6 +900,7 @@ def is_period_label(text: str) -> bool:
         r"(?:6t|9t|h[12]|s[12])\d{2,4}|20\d{2}|fy\d{2,4}|"
         r"20\d{2}[-/.](?:0?[1-9]|1[0-2])|"
         r"(?:0?[1-9]|1[0-2])[-/.]20\d{2}|"
+        r"(?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])[-/.]20\d{2}|"
         r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\d{2,4}|"
         r"(?:t|thang)(?:0?[1-9]|1[0-2])(?:/)?\d{2,4})",
         value, re.IGNORECASE,
@@ -769,6 +1011,55 @@ def spatial_time_chart_ir(labels: list[Segment], context: str) -> ChartIR | None
 def spatial_time_chart_table(labels: list[Segment], context: str) -> str | None:
     chart = spatial_time_chart_ir(labels, context)
     return render_chart_ir(chart) if chart is not None else None
+
+
+def positioned_chart_ir(labels: list[Segment], context: str) -> ChartIR | None:
+    """Build the strongest chart IR available from positioned OCR labels."""
+    return spatial_time_chart_ir(labels, context) or spatial_categorical_chart_ir(
+        labels, context
+    )
+
+
+def choose_stronger_spatial_labels(
+    original: list[Segment], retry: list[Segment], context: str
+) -> list[Segment]:
+    """Prevent a sparse per-band retry from erasing a stronger bbox read."""
+    def strongest_ir(labels: list[Segment]) -> ChartIR | None:
+        candidates = [positioned_chart_ir(labels, context)]
+        candidates.extend(
+            chart_ir_from_markdown(label.text, label.source, min_data_rows=1)
+            for label in labels if markdown_tables(label.text)
+        )
+        valid = (chart for chart in candidates if chart is not None)
+        if looks_like_time_chart_context(context):
+            # A fluent OCR table can still be semantically unrelated to the
+            # time axis (for example legend colours interpreted as rows).
+            # Do not let its larger cell count outrank sparse, directly read
+            # endpoint labels that use the printed periods.
+            valid = (
+                chart for chart in valid
+                if chart.categories
+                and sum(is_period_label(item) for item in chart.categories)
+                / len(chart.categories) >= 0.80
+            )
+        return max(
+            valid,
+            key=lambda chart: (
+                len(chart.observations), chart_ir_category_coverage(chart)
+            ),
+            default=None,
+        )
+
+    original_ir = strongest_ir(original)
+    retry_ir = strongest_ir(retry)
+
+    def score(chart: ChartIR | None) -> tuple[int, float]:
+        return (
+            (len(chart.observations), chart_ir_category_coverage(chart))
+            if chart is not None else (0, 0.0)
+        )
+
+    return retry if score(retry_ir) > score(original_ir) else original
 
 
 def spatial_categorical_chart_ir(labels: list[Segment], context: str) -> ChartIR | None:
@@ -909,11 +1200,24 @@ def local_chart_context(target: Segment, segments: Iterable[Segment]) -> str:
 
 
 def chart_target_indexes(segments: list[Segment]) -> tuple[set[int], str]:
+    def native_geometry(segment: Segment) -> bool:
+        return segment.source in {
+            "native_geometry", "native_title_geometry",
+            "native_profile_geometry",
+        }
+
     direct = {
         i for i, segment in enumerate(segments)
         if segment.cls.casefold() == "chart"
         and (
-            segment.source == "native_geometry"
+            segment.bbox[1] >= 0.14
+            or native_geometry(segment)
+            or bool(markdown_tables(segment.text))
+            or len(VISIBLE_NUMBER_TOKEN.findall(segment.text)) >= 2
+            or looks_like_chart_title(segment.text)
+        )
+        and (
+            native_geometry(segment)
             or bool(markdown_tables(segment.text))
             or len(VISIBLE_NUMBER_TOKEN.findall(segment.text)) >= 2
             or looks_like_chart_title(segment.text)
@@ -924,6 +1228,7 @@ def chart_target_indexes(segments: list[Segment]) -> tuple[set[int], str]:
         i
         for i, segment in enumerate(segments)
         if segment.cls.casefold() == "picture"
+        and segment.bbox[1] >= 0.14
         and (looks_like_chart_title(segment.text) or nearby_chart_caption(segment, segments))
     }
     chart_like_tables = {
@@ -1077,6 +1382,132 @@ def native_text_for_segment(segment: Segment, page: PdfTextPage) -> str:
     ).strip()
 
 
+def native_chart_value_evidence(
+    target: Segment, page: PdfTextPage
+) -> tuple[str, str]:
+    """Return all native chart text and likely interior data-label text.
+
+    Axis ticks live at the left edge and x-axis categories at the bottom. They
+    are useful to establish that a born-digital chart has selectable text, but
+    they are not point values and must never verify an OCR-generated cell.
+    """
+    full: list[str] = []
+    interior: list[str] = []
+    x1, y1, x2, y2 = target.bbox
+    width, height = max(0.001, x2 - x1), max(0.001, y2 - y1)
+    for line in page.lines:
+        box = pdf_bbox_to_model(line.bbox, page)
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        if not (x1 <= cx <= x2 and y1 <= cy <= y2):
+            continue
+        full.append(line.text)
+        if (
+            x1 + width * 0.12 < cx < x2 - width * 0.03
+            and y1 + height * 0.12 < cy < y2 - height * 0.18
+            and VISIBLE_NUMBER_TOKEN.search(line.text)
+        ):
+            interior.append(line.text)
+    return "\n".join(full), "\n".join(interior)
+
+
+def native_endpoint_time_chart_ir(
+    target: Segment, page: PdfTextPage
+) -> ChartIR | None:
+    """Build a time-series skeleton from printed dates and endpoint labels.
+
+    Multi-line performance plots often print no intermediate point values, but
+    do print ``series, value%`` beside the last point.  Those endpoint labels
+    are direct evidence: serialize them only at the final printed period and
+    leave every unlabelled point blank.
+    """
+    full, _ = native_chart_value_evidence(target, page)
+    periods: list[str] = []
+    for match in OCR_CHART_TOKEN.finditer(full):
+        token = match.group().strip()
+        if is_period_label(token) and token not in periods:
+            periods.append(token)
+    if len(periods) < 2:
+        return None
+
+    endpoints: list[tuple[str, str]] = []
+    endpoint_pattern = re.compile(
+        r"^\s*([^|]+?[A-Za-zÀ-ỹ][^|]*?)\s*[,;:]\s*"
+        r"([+\-−–]?\d[\d.,]*%)\s*$",
+        re.IGNORECASE,
+    )
+    for line in full.splitlines():
+        match = endpoint_pattern.match(line)
+        if not match:
+            continue
+        series = match.group(1).strip(" -*•\t")
+        value = compact_numeric_label(match.group(2))
+        if not series or value is None:
+            continue
+        key = normalize_text(series)
+        if key not in {normalize_text(item[0]) for item in endpoints}:
+            endpoints.append((series, value))
+    if len(endpoints) < 2:
+        return None
+
+    final_period = periods[-1]
+    return ChartIR(
+        "Kỳ",
+        tuple(series for series, _ in endpoints),
+        tuple(periods),
+        tuple(
+            ChartObservation(
+                final_period, series, value, "native_endpoint_label"
+            )
+            for series, value in endpoints
+        ),
+        "native_endpoint_labels",
+    )
+
+
+def bind_chart_to_native_value_labels(
+    chart: Segment, target: Segment, page: PdfTextPage, context: str
+) -> Segment:
+    """Mask OCR values that are not printed inside a born-digital plot."""
+    if "chart_raw_source=native_endpoint_labels" in chart.text:
+        # This table was already constructed exclusively from the selectable
+        # endpoint labels; repeated values belonging to different series are
+        # valid and must not be collapsed by fingerprint-based masking.
+        return chart
+    if not markdown_tables(chart.text):
+        return chart
+    full, evidence = native_chart_value_evidence(target, page)
+    # Compact profile plots are sometimes raster graphics embedded in an
+    # otherwise born-digital page.  Their surrounding fiscal/performance rows
+    # prove that the plot exists, but an empty selectable plot layer provides
+    # no evidence for point values.  Keep its categories/skeleton and withhold
+    # every generated value instead of accepting axis ticks as observations.
+    if target.source == "native_profile_geometry" and not VISIBLE_NUMBER_TOKEN.search(evidence):
+        masked = mask_all_chart_values(chart.text)
+        if masked == chart.text:
+            return chart
+        return replace(
+            chart,
+            text=masked,
+            chart_ir=chart_ir_from_markdown(masked, "native_value_labels", min_data_rows=1),
+            source="uncertain:native plot has no printed value labels",
+        )
+    # Do not constrain scans or charts whose selectable text layer is absent.
+    if len(VISIBLE_NUMBER_TOKEN.findall(full)) < 2:
+        return chart
+    masked = (
+        mask_unverified_chart_values(chart.text, evidence)
+        if VISIBLE_NUMBER_TOKEN.search(evidence)
+        else mask_all_chart_values(chart.text)
+    )
+    if masked == chart.text:
+        return chart
+    ir = chart_ir_from_markdown(masked, "native_value_labels", min_data_rows=1)
+    return replace(
+        chart, text=masked, chart_ir=ir,
+        source="uncertain:native plot-label evidence",
+    )
+
+
 def text_token_overlap(first: str, second: str) -> float:
     tokens = re.compile(r"[a-z0-9]+(?:[.,][0-9]+)?", re.IGNORECASE)
     left = set(tokens.findall(fold_text(first)))
@@ -1196,8 +1627,23 @@ def recover_missing_native_text(
 
 def native_text_coverage(segments: list[Segment], page: PdfTextPage) -> float:
     """Token recall quality gate for the page's native PDF text layer."""
+    visual_boxes = [
+        segment.bbox for segment in segments
+        if segment.cls.casefold() in {"chart", "picture"}
+    ]
+    native_lines: list[str] = []
+    for line in page.lines:
+        box = pdf_bbox_to_model(line.bbox, page)
+        center = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+        if any(
+            visual[0] <= center[0] <= visual[2]
+            and visual[1] <= center[1] <= visual[3]
+            for visual in visual_boxes
+        ):
+            continue
+        native_lines.append(line.text)
     native = Counter(re.findall(
-        r"[a-z0-9]+", fold_text(" ".join(line.text for line in page.lines))
+        r"[a-z0-9]+", fold_text(" ".join(native_lines))
     ))
     output = Counter(re.findall(
         r"[a-z0-9]+", fold_text(" ".join(segment.text for segment in segments))
@@ -1253,6 +1699,25 @@ def native_table_for_segment(segment: Segment, page: PdfTextPage) -> str | None:
     rendered = [markdown_row(run[0]), markdown_row([":---"] + ["---:"] * (width - 1))]
     rendered.extend(markdown_row(row) for row in run[1:])
     return "\n".join(rendered)
+
+
+def robust_native_report_table(markdown: str | None) -> bool:
+    """Distinguish a real report table from two chart axes aligned by chance."""
+    if not markdown:
+        return False
+    tables = markdown_tables(markdown)
+    if not tables:
+        return False
+    rows = tables[0]
+    separator = next((
+        index for index, row in enumerate(rows)
+        if row and all(TABLE_SEPARATOR.fullmatch(cell) for cell in row)
+    ), None)
+    if separator is None or separator == 0:
+        return False
+    width = len(rows[separator - 1])
+    data_rows = len(rows) - separator - 1
+    return width >= 3 or data_rows >= 2
 
 
 def extract_native_table_candidates(page: PdfTextPage) -> list[str]:
@@ -1495,6 +1960,13 @@ def recover_misclassified_visuals(
                 )
                 replacements += 1
                 continue
+        # A chart table that is not a native rectangular report table remains
+        # a chart candidate even when one OCR read has quality issues. Later
+        # evidence checks will mask or reject values; prose density must not
+        # erase the visual itself.
+        if markdown_tables(segment.text):
+            result.append(segment)
+            continue
         native = native_text_for_segment(segment, page)
         word_count = len(re.findall(r"[^\W\d_]{2,}", native, re.UNICODE))
         longest_line = max(
@@ -1578,6 +2050,14 @@ def infer_native_chart_segments(
             min(page.height, source.bbox[1] - 3.0),
         )
         model_bbox = pdf_bbox_to_model(native_bbox, page)
+        candidate_segment = Segment(
+            len(segments) + len(inferred), "Chart", model_bbox,
+            title.text.strip(), "native_title_geometry",
+        )
+        if robust_native_report_table(
+            native_table_for_segment(replace(candidate_segment, cls="Table"), page)
+        ):
+            continue
         if any(
             segment.cls.casefold() in {"chart", "picture", "table"}
             and bbox_overlap(segment.bbox, model_bbox) >= 0.25
@@ -1596,6 +2076,147 @@ def infer_native_chart_segments(
     if not inferred:
         return segments, 0
     return segments + inferred, len(inferred)
+
+
+def infer_native_chart_segments_from_titles(
+    segments: list[Segment], page: PdfTextPage
+) -> tuple[list[Segment], int]:
+    """Recover side-by-side born-digital plots from explicit title geometry."""
+    sources = [line for line in page.lines if is_source_label(line.text)]
+    inferred: list[Segment] = []
+    for title in page.lines:
+        height = title.bbox[3] - title.bbox[1]
+        if (
+            not 10 <= height <= 22
+            or title.bbox[1] > page.height * 0.52
+            or len(title.text.strip()) > 100
+            or not (
+                looks_like_visual_caption_text(title.text)
+                or (
+                    len(title.text.split()) <= 20
+                    and re.search(r"[^\W\d_]", title.text, re.UNICODE)
+                    and not re.search(r"[.!?]\s*$", title.text)
+                )
+            )
+            or compact_numeric_label(title.text.strip()) is not None
+            or re.match(r"^[+\-]?\d", title.text.strip())
+            or bool(re.fullmatch(r"[A-Z]{2,8}", title.text.strip()))
+            or title.text.strip().startswith("(")
+            or fold_text(title.text).strip() in {
+                "linh", "vuc", "ma", "san", "fy 2021", "fy 2022", "fy 2023",
+                "fy 2024", "fy 2025", "fy 2026 f", "dtt", "lnst",
+            }
+        ):
+            continue
+        below = [
+            source for source in sources
+            if 80 <= source.bbox[1] - title.bbox[3] <= 340
+            and max(
+                0.0,
+                min(title.bbox[2], source.bbox[2])
+                - max(title.bbox[0], source.bbox[0]),
+            ) / max(1.0, title.bbox[2] - title.bbox[0]) >= 0.20
+        ]
+        if not below:
+            continue
+        source = min(below, key=lambda item: item.bbox[1])
+        if (
+            title.bbox[1] >= page.height * 0.55
+            and fold_text(title.text).strip().startswith(
+                ("doanh thu", "ty le lnhdkd", "lai rong", "ln", "eps", "roe", "p/e", "p/b", "co tuc")
+            )
+        ):
+            continue
+        native_bbox = (
+            max(0.0, min(title.bbox[0], source.bbox[0]) - 12.0),
+            max(0.0, title.bbox[1] - 4.0),
+            min(page.width, max(title.bbox[2], source.bbox[2]) + 12.0),
+            min(page.height, source.bbox[1] - 3.0),
+        )
+        model_bbox = pdf_bbox_to_model(native_bbox, page)
+        candidate_segment = Segment(
+            len(segments) + len(inferred), "Chart", model_bbox,
+            title.text.strip(), "native_title_geometry",
+        )
+        if robust_native_report_table(
+            native_table_for_segment(replace(candidate_segment, cls="Table"), page)
+        ):
+            continue
+        if any(
+            item.cls.casefold() in {"chart", "picture", "table"}
+            and bbox_overlap(item.bbox, model_bbox) >= 0.20
+            for item in [*segments, *inferred]
+        ):
+            continue
+        _, interior = native_chart_value_evidence(
+            Segment(0, "Chart", model_bbox, title.text), page
+        )
+        # A plot needs an axis/category skeleton. This avoids promoting prose
+        # headings or infographic cards merely because a source line follows.
+        native = native_text_for_segment(
+            Segment(0, "Chart", model_bbox, title.text), page
+        )
+        if "→" in native:
+            continue
+        category_tokens = [
+            word for word in re.findall(r"[A-Za-zÀ-ỹ][\wÀ-ỹ./-]*", native)
+            if len(word) <= 16
+        ]
+        if len(category_tokens) < 3 and not interior:
+            continue
+        inferred.append(candidate_segment)
+    if not inferred:
+        return segments, 0
+    return [*segments, *inferred], len(inferred)
+
+
+def infer_native_profile_chart_segment(
+    segments: list[Segment], page: PdfTextPage
+) -> tuple[list[Segment], int]:
+    """Recover the performance plot in a compact equity-profile layout."""
+    rows: list[list[PdfTextLine]] = []
+    for line in page.lines:
+        if not rows or abs(line.bbox[1] - rows[-1][0].bbox[1]) > 1.5:
+            rows.append([line])
+        else:
+            rows[-1].append(line)
+    fy_row = next((
+        row for row in rows
+        if sum(bool(re.fullmatch(r"FY\s*20\d{2}(?:\s*\(F\))?", line.text, re.I))
+               for line in row) >= 5
+    ), None)
+    performance_row = next((
+        row for row in rows
+        if {normalize_text(line.text) for line in row} >= {"1 m", "3m", "12m"}
+    ), None)
+    if fy_row is None or performance_row is None:
+        return segments, 0
+    fiscal_headers = [
+        line for line in fy_row
+        if re.fullmatch(r"FY\s*20\d{2}(?:\s*\(F\))?", line.text, re.I)
+    ]
+    first_fy_x = min(line.bbox[0] for line in fiscal_headers)
+    y1 = min(line.bbox[1] for line in fy_row) - 8.0
+    y2 = min(page.height * 0.965, max(
+        (line.bbox[3] for line in page.lines if line.bbox[1] >= y1),
+        default=page.height * 0.90,
+    ))
+    native_bbox = (
+        page.width * 0.27, max(0.0, y1),
+        min(first_fy_x - 12.0, page.width * 0.56), y2,
+    )
+    model_bbox = pdf_bbox_to_model(native_bbox, page)
+    if any(
+        item.cls.casefold() in {"chart", "picture", "table"}
+        and bbox_overlap(item.bbox, model_bbox) >= 0.20
+        for item in segments
+    ):
+        return segments, 0
+    candidate = Segment(
+        len(segments), "Chart", model_bbox, "Hiệu suất giá tương đối",
+        "native_profile_geometry",
+    )
+    return [*segments, candidate], 1
 
 
 def native_metric_card_segments(page: PdfTextPage) -> list[Segment]:
@@ -1871,28 +2492,54 @@ def convert_table(text: str, model_dir: str | Path) -> str:
 
 def uncertain_chart(
     target: Segment, reason: str, candidates: Iterable[Segment | None] = (),
+    context: str = "",
 ) -> Segment:
     """Keep the best direct transcription as data without creating an image.
 
     Unconfirmed values remain useful for search and manual review, but are
     explicitly labelled as raw OCR. No value is synthesized or reconciled here.
     """
+    def eligible_candidate(candidate: Segment | None) -> bool:
+        if candidate is None:
+            return False
+        if not is_plausible_chart_transcription(candidate.text, context):
+            return False
+        # Whole-chart generated tables are never exposed from one pass. A table
+        # reconstructed in code from positioned labels may be retained as raw
+        # data even when it is too incomplete to confirm.
+        return (
+            not markdown_tables(candidate.text)
+            or candidate.source in {
+                "combo_raw_evidence", "evidence_bound_table", "focused_chart_spatial",
+                "focused_chart_spatial_consensus", "native_endpoint_labels",
+            }
+        )
+
     available = [
         candidate
         for candidate in candidates
-        if candidate is not None
-        and is_plausible_chart_transcription(candidate.text)
+        if eligible_candidate(candidate)
     ]
-    if target.text.strip() and all(candidate is not target for candidate in available):
+    if (
+        eligible_candidate(target)
+        and all(candidate is not target for candidate in available)
+    ):
         available.append(target)
 
     def transcription_score(candidate: Segment) -> tuple[int, int, int, int, int]:
         cleaned = clean_generated_text(candidate.text)
-        valid = not chart_quality_issues(cleaned)
-        direct = candidate.source.startswith(("pass2", "focused_chart"))
-        exact_native = candidate.source == "text_layer_chart_raw"
+        valid = not chart_quality_issues(cleaned, context)
+        consensus = candidate.source == "focused_chart_spatial_consensus"
+        bound = candidate.source in {
+            "combo_raw_evidence", "evidence_bound_table", "focused_chart_spatial",
+            "focused_chart_spatial_consensus", "native_endpoint_labels",
+        }
+        chart = candidate.chart_ir or chart_ir_from_markdown(
+            cleaned, candidate.source, min_data_rows=1
+        )
+        observations = len(chart.observations) if chart is not None else 0
         numbers = len(NUMBER_TOKEN.findall(cleaned))
-        return int(valid), numbers, int(direct), int(exact_native), len(cleaned)
+        return int(consensus), int(bound), int(valid), observations, numbers
 
     best = max(available, key=transcription_score, default=None)
     note = (
@@ -1914,8 +2561,27 @@ def uncertain_chart(
 
 def native_chart_caption(target: Segment, page: PdfTextPage | None) -> list[str]:
     """Read a chart title/subtitle from exact nearby PDF text geometry."""
+    if target.source in {
+        "native_geometry", "native_title_geometry", "native_profile_geometry",
+    }:
+        embedded = [
+            line.strip() for line in target.text.splitlines()
+            if looks_like_visual_caption_text(line)
+        ]
+        if embedded:
+            # Geometry inference already bound this exact title to the plot.
+            # Prefer it over nearby unit labels such as "Triệu USD"/"YoC %".
+            return embedded[:2]
     if page is None:
         return []
+    profile_candidates, _ = infer_native_profile_chart_segment([], page)
+    profile = next((
+        candidate for candidate in profile_candidates
+        if candidate.source == "native_profile_geometry"
+        and bbox_overlap(candidate.bbox, target.bbox) >= 0.20
+    ), None)
+    if profile is not None:
+        return [profile.text]
     candidates: list[tuple[float, float, tuple[float, float, float, float], str]] = []
     for line in page.lines:
         box = pdf_bbox_to_model(line.bbox, page)
@@ -1931,7 +2597,14 @@ def native_chart_caption(target: Segment, page: PdfTextPage | None) -> list[str]
             candidates.append((height, box[1], box, line.text.strip()))
     if not candidates:
         return []
-    _, _, title_box, title = max(candidates, key=lambda item: (item[0], -item[1]))
+    _, _, title_box, title = max(
+        candidates,
+        key=lambda item: (
+            min(8, len(re.findall(r"[^\W\d_]+", item[3], re.UNICODE))),
+            item[0],
+            -item[1],
+        ),
+    )
     subtitles: list[tuple[float, str]] = []
     for line in page.lines:
         box = pdf_bbox_to_model(line.bbox, page)
@@ -2264,11 +2937,25 @@ def chart_region_png(
         bottom = round(((y2 * 2048 - pad_y) / resized_height) * height)
         left, right = max(0, left), min(width, right)
         top, bottom = max(0, top), min(height, bottom)
-        extra_x = round((right - left) * padding)
-        extra_y = round((bottom - top) * padding)
+        region_width = right - left
+        inner_x = round(region_width * max(padding, 0.04))
+        outer_x = round(region_width * max(padding, 0.25))
+        center_x = (left + right) / 2
+        if center_x < width / 2:
+            extra_left, extra_right = outer_x, inner_x
+        else:
+            extra_left, extra_right = inner_x, outer_x
+        # Layout bboxes often start at the bar/line body and omit numeric
+        # labels printed just above it. Add top-only headroom without widening
+        # into a neighbouring chart column.
+        extra_top = round((bottom - top) * max(padding, 0.35))
+        # Layout boxes also tend to stop on the baseline and clip low endpoint
+        # annotations (for example the lower series label at the final point).
+        # A smaller bottom margin than the top headroom is sufficient.
+        extra_bottom = round((bottom - top) * max(padding, 0.10))
         region = (
-            max(0, left - extra_x), max(0, top - extra_y),
-            min(width, right + extra_x), min(height, bottom + extra_y),
+            max(0, left - extra_left), max(0, top - extra_top),
+            min(width, right + extra_right), min(height, bottom + extra_bottom),
         )
         if region[2] <= region[0] or region[3] <= region[1]:
             raise ValueError(f"invalid chart bbox: {bbox}")
@@ -2296,7 +2983,15 @@ def chart_category_band_png(
         # horizontal overlap keeps labels near a band boundary intact.
         # Exclude title/subtitle text: it adds unrelated digits such as years
         # and competes with the much smaller bar labels.
-        plot_top, plot_bottom = round(height * 0.31), round(height * 0.90)
+        # Stop where the dedicated x-axis crop begins. Including the lower
+        # axis makes Nemotron return `2026`/`1Q26` instead of the nearby small
+        # value label and was a frequent source of false numeric evidence.
+        # Wide time-series crops contain title headroom added by
+        # ``chart_region_png``; skip that area so a subtitle such as
+        # "6 quý gần nhất" cannot become a chart value. Short categorical
+        # charts may place the tallest bar label at the very top, so retain it.
+        plot_top = 0 if count <= 4 else round(height * 0.20)
+        plot_bottom = height
         # Chart titles and source notes normally span the full crop, while the
         # actual x-axis is inset. Dividing the full image shifts the edge
         # categories into the wrong bands, especially on six-period charts.
@@ -2307,11 +3002,31 @@ def chart_category_band_png(
         overlap = band_width * 0.05
         left = max(0, round(plot_left + index * band_width - overlap))
         right = min(width, round(plot_left + (index + 1) * band_width + overlap))
+        # Endpoint annotations are frequently printed just outside the first
+        # or last marker rather than over its centre.
+        if index == 0:
+            left = 0
+        if index == count - 1:
+            right = width
         band = image.crop((left, plot_top, right, plot_bottom))
+        ink = ImageOps.invert(ImageOps.grayscale(band)).point(
+            lambda value: 255 if value > 12 else 0
+        )
+        content_box = ink.getbbox()
+        if content_box is not None:
+            pad = max(8, round(band.width * 0.04))
+            band = band.crop((
+                max(0, content_box[0] - pad), max(0, content_box[1] - pad),
+                min(band.width, content_box[2] + pad),
+                min(band.height, content_box[3] + pad),
+            ))
         if variant == "contrast":
             band = ImageOps.autocontrast(ImageOps.grayscale(band), cutoff=1).convert("RGB")
             band = ImageEnhance.Contrast(band).enhance(1.35)
             band = band.filter(ImageFilter.SHARPEN)
+        elif variant == "binary":
+            gray = ImageOps.autocontrast(ImageOps.grayscale(band), cutoff=1)
+            band = gray.point(lambda value: 255 if value >= 175 else 0).convert("RGB")
         elif variant != "color":
             raise ValueError(f"unknown chart band variant: {variant}")
         if band.width < 1000:
@@ -2321,6 +3036,32 @@ def chart_category_band_png(
             )
         output = BytesIO()
         band.save(output, format="PNG")
+        return output.getvalue()
+
+
+def chart_axis_band_png(chart_png: bytes, index: int, count: int = 3) -> bytes:
+    """Crop one compact x-axis chunk to avoid extreme panoramic input."""
+    if count < 1 or not 0 <= index < count:
+        raise ValueError("invalid chart axis chunk")
+    with Image.open(BytesIO(chart_png)) as image:
+        image = image.convert("RGB")
+        width, height = image.size
+        axis_left, axis_right = width * 0.06, width * 0.94
+        chunk_width = (axis_right - axis_left) / count
+        overlap = chunk_width * 0.06
+        left = max(0, round(axis_left + index * chunk_width - overlap))
+        right = min(width, round(axis_left + (index + 1) * chunk_width + overlap))
+        axis = image.crop((left, round(height * 0.70),
+                           right, round(height * 0.88)))
+        axis = ImageOps.autocontrast(ImageOps.grayscale(axis), cutoff=1).convert("RGB")
+        axis = ImageEnhance.Contrast(axis).enhance(1.35)
+        if axis.width < 1000:
+            scale = 1000 / axis.width
+            axis = axis.resize(
+                (1000, max(1, round(axis.height * scale))), Image.Resampling.LANCZOS
+            )
+        output = BytesIO()
+        axis.save(output, format="PNG")
         return output.getvalue()
 
 
@@ -2455,7 +3196,7 @@ def read_chart_region_evidence(
 
 
 def chart_categories_from_candidates(
-    candidates: Iterable[Segment | None],
+    candidates: Iterable[Segment | None], periods_only: bool = False,
 ) -> list[str]:
     """Get an ordered category skeleton without trusting candidate values."""
     for candidate in candidates:
@@ -2467,9 +3208,61 @@ def chart_categories_from_candidates(
         if chart is None:
             continue
         categories = list(dict.fromkeys(chart.categories))
-        if 2 <= len(categories) <= 12:
+        if (
+            2 <= len(categories) <= 16
+            and (not periods_only or all(is_period_label(item) for item in categories))
+        ):
             return categories
     return []
+
+
+def looks_like_time_chart_context(context: str) -> bool:
+    return bool(re.search(
+        r"\b(?:quy|quarter|monthly|month|thang|yearly|year|nam|6t|9t)\b",
+        fold_text(context),
+    ))
+
+
+def read_chart_time_axis_categories(
+    *, target: Segment, page_png: bytes, ocr_prompt: str, page_no: int,
+    chart_number: int, endpoint: str, model: str, timeout: int, retries: int,
+    raw_output_dir: str | None, padding: float,
+) -> list[str]:
+    """Read printed periods from an isolated x-axis crop; never synthesize."""
+    try:
+        chart_png = chart_region_png(page_png, target.bbox, padding)
+        raw_parts = []
+        for index in range(3):
+            raw_parts.append(request_ocr(
+                endpoint=endpoint, model=model,
+                image_b64=base64.b64encode(
+                    chart_axis_band_png(chart_png, index)
+                ).decode("ascii"),
+                prompt=ocr_prompt, max_tokens=160, timeout=timeout, retries=retries,
+                page_no=page_no,
+                pass_name=f"focused_chart_{chart_number}_axis_{index + 1}",
+                raw_output_dir=raw_output_dir,
+            ))
+        raw = "\n".join(raw_parts)
+    except (RuntimeError, ValueError, OSError):
+        return []
+    categories: list[str] = []
+    seen: set[str] = set()
+    for match in OCR_CHART_TOKEN.finditer(clean_unstructured_output(raw)):
+        token = match.group().strip()
+        key = normalize_text(token)
+        if is_period_label(token) and key not in seen:
+            categories.append(token)
+            seen.add(key)
+    return categories if 2 <= len(categories) <= 12 else []
+
+
+def should_read_chart_category_bands(
+    categories: list[str], spatial: ChartIR | None
+) -> bool:
+    """Use local evidence whenever an ordered category skeleton is available."""
+    del spatial
+    return 2 <= len(categories) <= 12
 
 
 def read_chart_category_bands(
@@ -2477,6 +3270,7 @@ def read_chart_category_bands(
     ocr_prompt: str, page_no: int, chart_number: int, endpoint: str,
     model: str, timeout: int, retries: int, raw_output_dir: str | None,
     padding: float, verification_prompt: str | None = None,
+    category_source: str = "category_generated",
 ) -> list[Segment]:
     """OCR independent x bands and optionally retain only two-prompt consensus.
 
@@ -2492,22 +3286,30 @@ def read_chart_category_bands(
         return []
 
     def request_band(
-        index: int, prompt: str, pass_suffix: str, variant: str
+        index: int, prompt: str, pass_suffix: str, variant: str,
+        vertical_zone: str | None = None,
     ) -> str:
-        instruction = (
-            "\nRead only the visible x-axis category and numeric data labels "
-            "in this single chart slice. Preserve every sign, separator, "
-            "decimal mark, percent sign, and digit exactly. Do not describe "
-            "bar shapes, colors, axes, or partial text at the image edges."
+        band_png = chart_category_band_png(
+            chart_png, index, len(categories), variant=variant
         )
+        if vertical_zone is not None:
+            with Image.open(BytesIO(band_png)) as band_image:
+                band_image = band_image.convert("RGB")
+                split = 0.62 if vertical_zone == "top" else 0.38
+                box = (
+                    (0, 0, band_image.width, round(band_image.height * split))
+                    if vertical_zone == "top"
+                    else (0, round(band_image.height * split),
+                          band_image.width, band_image.height)
+                )
+                band_image = band_image.crop(box)
+                buffer = BytesIO()
+                band_image.save(buffer, format="PNG")
+                band_png = buffer.getvalue()
         raw = request_ocr(
             endpoint=endpoint, model=model,
-            image_b64=base64.b64encode(
-                chart_category_band_png(
-                    chart_png, index, len(categories), variant=variant
-                )
-            ).decode("ascii"),
-            prompt=prompt + instruction, max_tokens=160,
+            image_b64=base64.b64encode(band_png).decode("ascii"),
+            prompt=prompt, max_tokens=160,
             timeout=timeout, retries=retries,
             page_no=page_no,
             pass_name=(
@@ -2527,7 +3329,7 @@ def read_chart_category_bands(
                 result.append(token)
         return result
 
-    def consensus_tokens(primary: list[str], verification: list[str]) -> list[str]:
+    def common_tokens(primary: list[str], verification: list[str]) -> list[str]:
         available = Counter(numeric_label_fingerprint(token) for token in verification)
         result: list[str] = []
         for token in primary:
@@ -2538,29 +3340,171 @@ def read_chart_category_bands(
             result.append(token)
         return result
 
+    def majority_tokens(*reads: list[str]) -> list[str]:
+        counts = Counter(
+            numeric_label_fingerprint(token)
+            for read in reads for token in set(read)
+        )
+        order = [*reads[0], *reads[1], *(reads[2] if len(reads) > 2 else [])]
+        result: list[str] = []
+        for token in order:
+            fingerprint = numeric_label_fingerprint(token)
+            if counts[fingerprint] >= 2 and fingerprint not in {
+                numeric_label_fingerprint(item) for item in result
+            }:
+                result.append(token)
+        return result
+
     reads: dict[int, list[str]] = {}
-    try:
-        for index in range(len(categories)):
-            primary_suffix = "" if verification_prompt is None else ".labels"
+    primary_reads: dict[int, list[str]] = {}
+    for index in range(len(categories)):
+        primary_suffix = "" if verification_prompt is None else ".labels"
+        try:
             primary = numeric_tokens(
                 request_band(index, ocr_prompt, primary_suffix, "color")
             )
-            if verification_prompt is None:
-                reads[index] = primary
-                continue
+        except (RuntimeError, ValueError, OSError):
+            primary = []
+        primary_reads[index] = primary
+        if verification_prompt is None:
+            reads[index] = primary
+            continue
+        try:
             verification = numeric_tokens(
                 request_band(index, verification_prompt, ".contrast", "contrast")
             )
-            reads[index] = consensus_tokens(primary, verification)
-    except (RuntimeError, ValueError, OSError):
-        return []
+        except (RuntimeError, ValueError, OSError):
+            verification = []
+        agreed = common_tokens(primary, verification)
+        # A third view is adaptive: it is requested only when the first
+        # two differ or one misses a visible number. Exact 2-of-3 voting
+        # resolves lost separators without accepting digit-only matches.
+        if primary != verification:
+            try:
+                binary = numeric_tokens(
+                    request_band(index, verification_prompt, ".binary", "binary")
+                )
+            except (RuntimeError, ValueError, OSError):
+                binary = []
+            agreed = majority_tokens(primary, verification, binary)
+            label_binary: list[str] = []
+            if binary and not agreed:
+                try:
+                    label_binary = numeric_tokens(request_band(
+                        index, ocr_prompt, ".labels_binary_retry", "binary"
+                    ))
+                except (RuntimeError, ValueError, OSError):
+                    label_binary = []
+                zone_labels: list[str] = []
+                for zone in ("top", "bottom"):
+                    try:
+                        zone_labels.extend(numeric_tokens(request_band(
+                            index, ocr_prompt, f".labels_{zone}_retry",
+                            "color", vertical_zone=zone,
+                        )))
+                    except (RuntimeError, ValueError, OSError):
+                        pass
+                # A number reproduced by the plain and bbox tasks on the
+                # binary image is cross-prompt evidence. Prefer its printed
+                # separator over a bbox-only colour/contrast pair.
+                verified_skeletons = {
+                    re.sub(r"[.,]", "", numeric_label_fingerprint(token))
+                    for token in [*label_binary, *zone_labels]
+                }
+                for token in binary:
+                    if re.sub(
+                        r"[.,]", "", numeric_label_fingerprint(token)
+                    ) not in verified_skeletons:
+                        continue
+                    skeleton = re.sub(
+                        r"[.,]", "", numeric_label_fingerprint(token)
+                    )
+                    agreed = [
+                        item for item in agreed
+                        if re.sub(r"[.,]", "", numeric_label_fingerprint(item))
+                        != skeleton
+                    ]
+                    agreed.append(token)
+            # ``output_plain`` occasionally returns an empty response for a
+            # very small, otherwise crisp endpoint. Retry that transformed
+            # image with the bbox/label task and still require an exact match
+            # with the original colour read.
+            confirmed_primary = {
+                re.sub(r"[.,]", "", numeric_label_fingerprint(token))
+                for token in agreed
+            }
+            if len(primary) > len(agreed) and any(
+                re.sub(r"[.,]", "", numeric_label_fingerprint(token))
+                not in confirmed_primary for token in primary
+            ):
+                try:
+                    label_contrast = numeric_tokens(request_band(
+                        index, ocr_prompt, ".labels_contrast_retry", "contrast"
+                    ))
+                except (RuntimeError, ValueError, OSError):
+                    label_contrast = []
+                for token in common_tokens(primary, label_contrast):
+                    skeleton = re.sub(
+                        r"[.,]", "", numeric_label_fingerprint(token)
+                    )
+                    if skeleton not in {
+                        re.sub(r"[.,]", "", numeric_label_fingerprint(item))
+                        for item in agreed
+                    }:
+                        agreed.append(token)
+        reads[index] = agreed
+
+    def separatorless_fingerprint(token: str) -> str:
+        return re.sub(r"[.,]", "", numeric_label_fingerprint(token))
+
+    # When all views read the same digits but disagree only about a decimal
+    # mark, prefer the colour image: it retains the original thin punctuation
+    # better than contrast/binary variants. Voting still decides the digits.
+    for index, agreed in reads.items():
+        color = primary_reads.get(index, [])
+        color_order = {
+            separatorless_fingerprint(token): position
+            for position, token in enumerate(color)
+        }
+        if all(separatorless_fingerprint(token) in color_order for token in agreed):
+            agreed.sort(key=lambda token: color_order[
+                separatorless_fingerprint(token)
+            ])
+
+    # Use a clearly dominant decimal style only for one/two-digit fractional
+    # labels. This repairs an isolated `43.2` amid `371,5`, `55,8`, `287,7`
+    # without converting thousands such as `1.309` or inventing any value.
+    decimal_pattern = re.compile(
+        r"^[+\-]?\(?\d+([.,])\d{1,2}\)?(?:%|x)?$", re.IGNORECASE
+    )
+    separators = Counter()
+    for tokens in primary_reads.values():
+        for token in tokens:
+            match = decimal_pattern.fullmatch(token.strip())
+            if match:
+                separators[match.group(1)] += 1
+    accepted_tokens = [token for tokens in reads.values() for token in tokens]
+    percent_only = bool(accepted_tokens) and all(
+        token.strip().endswith("%") for token in accepted_tokens
+    )
+    if separators and not percent_only:
+        dominant, dominant_count = separators.most_common(1)[0]
+        total = sum(separators.values())
+        if total >= 3 and dominant_count / total >= 0.75:
+            for agreed in reads.values():
+                for position, token in enumerate(agreed):
+                    match = decimal_pattern.fullmatch(token.strip())
+                    if match and match.group(1) != dominant:
+                        agreed[position] = (
+                            token[:match.start(1)] + dominant + token[match.end(1):]
+                        )
 
     labels: list[Segment] = []
     for index, category in enumerate(categories):
         center = (index + 0.5) / len(categories)
         labels.append(Segment(
             index, "Text", (center - 0.035, 0.82, center + 0.035, 0.86),
-            category, "category_band_seed",
+            category, category_source,
         ))
         tokens = reads.get(index, [])
         # More than two values in one x band usually means title/axis leakage.
@@ -2615,9 +3559,10 @@ def choose_confirmed_chart(
             if candidate is not None and not chart_quality_issues(candidate.text, context)
         )
         return replace(chosen, order=target.order, bbox=target.bbox, cls="Chart")
-    for first, second in (
-        (full_page, verification), (target, full_page), (target, verification)
-    ):
+    # Two different OCR task/views may confirm only an exact, complete
+    # cell-for-cell match. This recovers clear bar charts while preventing a
+    # merely similar table from filling missing labels.
+    for first, second in ((target, full_page), (full_page, verification)):
         if (
             first is not None and second is not None
             and not chart_quality_issues(first.text, context)
@@ -2636,7 +3581,7 @@ def choose_confirmed_chart(
     })
     return uncertain_chart(
         target, ";".join(reasons) or "OCR reads disagree",
-        (*all_candidates, *raw_fallbacks),
+        (*all_candidates, *raw_fallbacks), context,
     )
 
 
@@ -2690,6 +3635,9 @@ def process_page(
         if fallback is None:
             raise RuntimeError(f"page {page_no + 1}: no readable OCR output")
         pass1 = [fallback]
+    initial_native_fallback = any(
+        segment.source == "native_page_fallback" for segment in pass1
+    )
 
     text_layer_replacements = 0
     if native_page is not None:
@@ -2702,12 +3650,33 @@ def process_page(
         text_layer_replacements += visual_replacements
         pass1, metric_card_replacements = coalesce_metric_cards(pass1, native_page)
         text_layer_replacements += metric_card_replacements
-        pass1, inferred_charts = infer_native_chart_segments(pass1, native_page)
-        text_layer_replacements += inferred_charts
-        pass1, recovered_text = recover_missing_native_text(pass1, native_page)
-        text_layer_replacements += recovered_text
+        # If the layout OCR collapsed or stopped early, preserve the complete
+        # native page first. Inferring chart rectangles from isolated labels in
+        # that state can turn a table cell, legend, or infographic card into a
+        # bogus chart target.
+        native_fallback_present = initial_native_fallback or any(
+            segment.source == "native_page_fallback" for segment in pass1
+        )
         pass1, full_fallback = use_full_native_text_if_ocr_truncated(pass1, native_page)
         text_layer_replacements += int(full_fallback)
+        if full_fallback or native_fallback_present:
+            pass1, titled_charts = infer_native_chart_segments_from_titles(
+                pass1, native_page
+            )
+            text_layer_replacements += titled_charts
+        else:
+            pass1, inferred_charts = infer_native_chart_segments(pass1, native_page)
+            text_layer_replacements += inferred_charts
+            pass1, titled_charts = infer_native_chart_segments_from_titles(
+                pass1, native_page
+            )
+            text_layer_replacements += titled_charts
+            pass1, recovered_text = recover_missing_native_text(pass1, native_page)
+            text_layer_replacements += recovered_text
+        pass1, profile_charts = infer_native_profile_chart_segment(
+            pass1, native_page
+        )
+        text_layer_replacements += profile_charts
 
     targets, reason = chart_target_indexes(pass1)
     # A model class alone is not enough evidence. Preserve any visible text but
@@ -2780,16 +3749,45 @@ def process_page(
                     spatial = spatial_categorical_chart_ir(
                         current_labels, current_context
                     )
-                spatial_coverage = chart_ir_category_coverage(spatial)
-                # A plausible-looking partial spatial read can contain digits
-                # split from neighbouring bars. Re-read independent x bands
-                # until most categories have direct, local evidence.
-                if spatial_coverage < 0.80:
-                    categories = chart_categories_from_candidates((
-                        focused_matches.get(target_index),
-                        pass2_matches.get(target_index),
-                        pass1[target_index],
-                    ))
+                time_context = looks_like_time_chart_context(current_context)
+                categories = chart_categories_from_candidates((
+                    focused_matches.get(target_index),
+                    pass2_matches.get(target_index),
+                    pass1[target_index],
+                ), periods_only=time_context)
+                category_source = "category_generated"
+                if spatial is not None:
+                    spatial_categories = list(dict.fromkeys(spatial.categories))
+                    if len(spatial_categories) > len(categories):
+                        categories = spatial_categories
+                        category_source = "focused_chart_label"
+                if (
+                    time_context
+                    or (categories and all(is_period_label(item) for item in categories))
+                ):
+                    axis_categories = read_chart_time_axis_categories(
+                        target=pass1[target_index], page_png=focused_page_png,
+                        ocr_prompt=focused_ocr_prompt or chart_label_prompt or chart_prompt,
+                        page_no=page_no, chart_number=chart_number,
+                        endpoint=endpoint, model=model, timeout=timeout,
+                        retries=retries, raw_output_dir=raw_output_dir,
+                        padding=chart_crop_padding,
+                    )
+                    candidate_periods_valid = bool(categories) and all(
+                        is_period_label(item) for item in categories
+                    )
+                    if axis_categories and (
+                        not candidate_periods_valid
+                        or len(axis_categories) >= len(categories)
+                    ):
+                        categories = axis_categories
+                        category_source = "focused_chart_axis"
+                    elif not candidate_periods_valid:
+                        categories = []
+                # Whole-chart OCR can look complete while assigning cropped or
+                # neighbouring digits to the wrong periods. Time-series charts
+                # therefore always receive local, per-period verification.
+                if should_read_chart_category_bands(categories, spatial):
                     band_labels = read_chart_category_bands(
                         target=pass1[target_index], page_png=focused_page_png,
                         categories=categories,
@@ -2802,22 +3800,30 @@ def process_page(
                             focused_ocr_prompt
                             if focused_ocr_prompt != chart_label_prompt else None
                         ),
+                        category_source=category_source,
                     )
                     if band_labels:
-                        focused_labels[target_index] = band_labels
-                        band_text = "\n".join(
-                            label.text for label in band_labels
-                            if label.source.startswith("focused_chart_band")
+                        # Never let a sparse per-band retry erase a stronger
+                        # positioned-label read from the whole chart crop.
+                        selected_labels = choose_stronger_spatial_labels(
+                            current_labels, band_labels, current_context
                         )
-                        focused_evidence[target_index] = Segment(
-                            pass1[target_index].order, "Chart",
-                            pass1[target_index].bbox, band_text,
-                            "focused_chart_band_evidence",
-                        )
+                        if selected_labels is band_labels:
+                            focused_labels[target_index] = selected_labels
+                            band_text = "\n".join(
+                                label.text for label in band_labels
+                                if label.source.startswith("focused_chart_band")
+                            )
+                            focused_evidence[target_index] = Segment(
+                                pass1[target_index].order, "Chart",
+                                pass1[target_index].bbox, band_text,
+                                "focused_chart_band_evidence",
+                            )
 
     replacements: dict[int, Segment] = {}
     for target_index in sorted(targets):
         target = pass1[target_index]
+        target_for_choice = target
         context = local_chart_context(target, pass1)
         full_page = pass2_matches.get(target_index)
         focused = focused_matches.get(target_index)
@@ -2838,6 +3844,10 @@ def process_page(
             consensus = bool(spatial_values) and all(
                 label.source == "focused_chart_band_consensus"
                 for label in spatial_values
+            ) and all(
+                label.source in {"focused_chart_axis", "focused_chart_label"}
+                for label in focused_labels.get(target_index, [])
+                if compact_numeric_label(label.text) is None
             )
             focused = Segment(
                 target.order, "Chart", target.bbox, render_chart_ir(spatial_ir),
@@ -2848,17 +3858,38 @@ def process_page(
                 spatial_ir,
             )
         if evidence is not None:
+            if markdown_tables(target_for_choice.text):
+                target_for_choice = replace(
+                    target_for_choice,
+                    text=mask_combo_line_without_evidence(
+                        target_for_choice.text, context, evidence.text
+                    ),
+                )
             if full_page is not None and markdown_tables(full_page.text):
                 full_page = replace(
                     full_page,
-                    text=mask_unverified_chart_values(full_page.text, evidence.text),
+                    text=mask_combo_line_without_evidence(
+                        full_page.text, context, evidence.text
+                    ),
                 )
-            if focused is not None and markdown_tables(focused.text):
+            if (
+                focused is not None and markdown_tables(focused.text)
+                and not focused.source.startswith("focused_chart_spatial")
+            ):
                 focused = replace(
                     focused,
-                    text=mask_unverified_chart_values(focused.text, evidence.text),
+                    text=mask_combo_line_without_evidence(
+                        focused.text, context, evidence.text
+                    ),
                 )
         else:
+            if markdown_tables(target_for_choice.text):
+                target_for_choice = replace(
+                    target_for_choice,
+                    text=mask_combo_line_without_evidence(
+                        target_for_choice.text, context
+                    ),
+                )
             if full_page is not None and markdown_tables(full_page.text):
                 full_page = replace(
                     full_page,
@@ -2870,9 +3901,62 @@ def process_page(
                     text=mask_combo_line_without_evidence(focused.text, context),
                 )
         raw_fallbacks: list[Segment] = []
+        if evidence is not None:
+            transposed = transposed_period_chart_ir(
+                evidence.text, "focused_chart_transposed_evidence"
+            )
+            if transposed is not None:
+                raw_fallbacks.append(Segment(
+                    target.order, "Chart", target.bbox,
+                    render_chart_ir(transposed),
+                    "focused_chart_spatial", transposed,
+                ))
+        else:
+            transposed = None
+        combo_candidates = [
+            combo_raw_chart_candidate(candidate, transposed, context)
+            for candidate in (pass2_matches.get(target_index), target)
+        ]
+        raw_fallbacks.extend(
+            candidate for candidate in combo_candidates if candidate is not None
+        )
+        generated_candidates = (
+            target,
+            pass2_matches.get(target_index),
+        )
+        generated_irs = {
+            id(candidate): chart_ir_from_markdown(
+                candidate.text, candidate.source, min_data_rows=1
+            )
+            for candidate in generated_candidates
+            if candidate is not None and markdown_tables(candidate.text)
+        }
+        max_series = max(
+            (len(chart.series) for chart in generated_irs.values() if chart is not None),
+            default=0,
+        )
+        for generated_candidate in generated_candidates:
+            generated_ir = (
+                generated_irs.get(id(generated_candidate))
+                if generated_candidate is not None else None
+            )
+            if generated_ir is not None and len(generated_ir.series) < max_series:
+                continue
+            evidence_bound = evidence_bound_chart_candidate(
+                generated_candidate, evidence, context
+            )
+            if evidence_bound is not None:
+                raw_fallbacks.append(evidence_bound)
         # Label evidence is an input to spatial reconstruction and cell masks;
         # it is not itself a candidate chart table.
         if native_page is not None:
+            native_endpoint_ir = native_endpoint_time_chart_ir(target, native_page)
+            if native_endpoint_ir is not None:
+                raw_fallbacks.append(Segment(
+                    target.order, "Chart", target.bbox,
+                    render_chart_ir(native_endpoint_ir),
+                    "native_endpoint_labels", native_endpoint_ir,
+                ))
             native_raw = native_text_for_segment(target, native_page)
             if native_raw:
                 raw_fallbacks.append(
@@ -2881,10 +3965,15 @@ def process_page(
                         "text_layer_chart_raw",
                     )
                 )
-        replacements[target_index] = choose_confirmed_chart(
-            target, full_page, focused,
+        chosen = choose_confirmed_chart(
+            target_for_choice, full_page, focused,
             context, chart_confirmation, raw_fallbacks,
         )
+        if native_page is not None:
+            chosen = bind_chart_to_native_value_labels(
+                chosen, target, native_page, context
+            )
+        replacements[target_index] = chosen
 
     pass1, replacements = attach_chart_captions(pass1, replacements, native_page)
     final_segments = [replacements.get(index, segment) for index, segment in enumerate(pass1)]
@@ -2971,6 +4060,10 @@ def parse_pdf(
     profile_prompt = (
         None if effective_profile == "auto" else profile_prompts[effective_profile]
     )
+    run_raw_output_dir = (
+        str(Path(raw_output_dir) / Path(pdf_path).stem)
+        if raw_output_dir else None
+    )
     kwargs = dict(
         pdf_path=pdf_path, endpoint=endpoint, model=model, zoom=zoom,
         max_tokens=max_tokens, chart_max_tokens=chart_max_tokens, timeout=timeout,
@@ -2978,7 +4071,7 @@ def parse_pdf(
         focused_ocr_prompt=prompts["ocr"],
         chart_label_prompt=prompts["label"],
         profile_prompt=profile_prompt, profile=effective_profile,
-        raw_output_dir=raw_output_dir,
+        raw_output_dir=run_raw_output_dir,
         chart_mode=chart_mode, retries=retries, focused_retry=focused_retry,
         chart_crop_zoom=chart_crop_zoom, chart_crop_padding=chart_crop_padding,
         use_text_layer=use_text_layer, chart_confirmation=chart_confirmation,
@@ -2999,7 +4092,8 @@ def parse_pdf(
         f"<!-- ocr_run requested_profile={requested_profile} "
         f"effective_profile={effective_profile} chart_mode={chart_mode} "
         f"chart_confirmation={chart_confirmation} zoom={zoom:g} "
-        f"chart_ocr_zoom={chart_crop_zoom:g} text_layer={str(use_text_layer).lower()} -->"
+        f"chart_ocr_zoom={chart_crop_zoom:g} text_layer={str(use_text_layer).lower()} "
+        f"raw_output_dir={run_raw_output_dir or 'disabled'} -->"
     )
     content = f"# {Path(pdf_path).name}\n\n{run_metadata}\n\n" + "\n\n---\n\n".join(
         f"<!-- page {result.page_no + 1} -->\n\n{result.markdown}" for result in results
@@ -3050,7 +4144,10 @@ def main() -> None:
     parser.add_argument("--ocr-prompt-file", default=str(PROMPT_FILES["ocr"]))
     parser.add_argument("--plain-prompt-file", default=str(PROMPT_FILES["plain"]))
     parser.add_argument("--fast-prompt-file", default=str(PROMPT_FILES["fast"]))
-    parser.add_argument("--raw-output-dir", default=None)
+    parser.add_argument(
+        "--raw-output-dir", default="debug_ocr",
+        help="save raw model responses for audit (default: debug_ocr)",
+    )
     parser.add_argument("--chart-mode", choices=("auto", "always", "never"), default="auto")
     parser.add_argument(
         "--chart-confirmation", choices=("strict", "single"), default="strict",

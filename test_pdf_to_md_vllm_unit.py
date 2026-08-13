@@ -7,42 +7,60 @@ from unittest.mock import patch
 from PIL import Image
 
 from pdf_to_md_vllm import (
+    ChartIR,
+    ChartObservation,
     PdfTextLine,
     PdfTextPage,
     Segment,
     aligned_plain_table_to_markdown,
     attach_chart_captions,
+    bind_chart_to_native_value_labels,
     chart_ir_from_markdown,
+    chart_categories_from_candidates,
     chart_quality_issues,
     chart_reads_agree,
     chart_target_indexes,
+    choose_stronger_spatial_labels,
     choose_confirmed_chart,
+    clean_unstructured_output,
     coalesce_metric_cards,
+    combo_raw_chart_candidate,
     coalesce_native_wide_tables,
     dedupe_consecutive_rows,
+    evidence_bound_chart_candidate,
     infer_native_chart_segments,
+    infer_native_chart_segments_from_titles,
+    infer_native_profile_chart_segment,
     is_degenerate_ocr,
+    is_period_label,
     match_chart_ocr_output,
     match_pass2_charts,
     mask_unverified_chart_values,
+    mask_all_chart_values,
     mask_combo_line_without_evidence,
     native_chart_caption,
+    native_endpoint_time_chart_ir,
     native_metric_card_segments,
     native_text_coverage,
     native_wide_table_segments,
+    numeric_label_fingerprint,
     parse_segments,
     postprocess_document,
     process_page,
     recover_misclassified_visuals,
     recover_missing_native_text,
+    render_chart_ir,
     read_chart_category_bands,
+    read_chart_time_axis_categories,
     reconcile_document_tables_with_pdf,
     remove_degenerate_document_lines,
     reconcile_tables_with_text_layer,
     repair_fused_trailing_comparison,
     simple_latex_table_to_markdown,
+    should_read_chart_category_bands,
     spatial_time_chart_table,
     spatial_categorical_chart_table,
+    transposed_period_chart_ir,
     use_full_native_text_if_ocr_truncated,
 )
 
@@ -55,6 +73,18 @@ GOOD_CHART = """### Biểu đồ: Doanh thu
 
 
 class SegmentParsingTests(unittest.TestCase):
+    def test_full_date_is_a_chart_period_label(self):
+        self.assertTrue(is_period_label("07/30/2025"))
+        self.assertTrue(is_period_label("7-30-2025"))
+
+    def test_unstructured_cleanup_removes_incomplete_bbox_coordinates(self):
+        self.assertEqual(
+            "38,3% 16,9%",
+            clean_unstructured_output(
+                "<x_0.3105>38,3%<y_0.88> 16,9%<class_Text>"
+            ),
+        )
+
     def test_parses_first_block_when_start_bbox_is_omitted(self):
         raw = "Tiêu đề<x_0.8><y_0.1><class_Title>"
         segments = parse_segments(raw)
@@ -79,6 +109,20 @@ Lãi thuần \& dịch vụ & (10) & 12,5\%\\
         result = simple_latex_table_to_markdown(latex)
         self.assertIn("| **Chỉ tiêu** | **Q1** | **Q2** |", result)
         self.assertIn("| Lãi thuần & dịch vụ | (10) | 12,5% |", result)
+
+    def test_numeric_identity_preserves_decimal_and_grouping_marks(self):
+        self.assertNotEqual(
+            numeric_label_fingerprint("1179"),
+            numeric_label_fingerprint("117,9"),
+        )
+        self.assertNotEqual(
+            numeric_label_fingerprint("10003"),
+            numeric_label_fingerprint("10.003"),
+        )
+        self.assertEqual(
+            numeric_label_fingerprint("−941"),
+            numeric_label_fingerprint("-941"),
+        )
 
     def test_converts_aligned_plain_ocr_table_without_splitting_prose(self):
         source = "Chỉ tiêu  Q1/2026  Q2/2026\nDoanh thu  100  120\nLợi nhuận  10  12"
@@ -135,6 +179,67 @@ After"""
 
 
 class ChartEvidenceTests(unittest.TestCase):
+    def test_native_endpoint_labels_make_sparse_time_table(self):
+        target = Segment(0, "Chart", (0.1, 0.1, 0.9, 0.9), "", "pass1")
+        page = PdfTextPage(1000, 1000, (
+            PdfTextLine((150, 800, 350, 820), "07/30/2025 08/30/2025 07/31/2026"),
+            PdfTextLine((700, 300, 790, 320), "VN-Index, 16%"),
+            PdfTextLine((700, 350, 790, 370), "FPT, -35%"),
+        ))
+        chart = native_endpoint_time_chart_ir(target, page)
+        self.assertIsNotNone(chart)
+        assert chart is not None
+        rendered = render_chart_ir(chart)
+        self.assertIn("| 07/30/2025 | — | — |", rendered)
+        self.assertIn("| 07/31/2026 | 16% | -35% |", rendered)
+
+    def test_masks_all_values_but_keeps_chart_categories(self):
+        chart = """| Kỳ | Chuỗi 1 | Chuỗi 2 |
+| :--- | ---: | ---: |
+| Jul 25 | 100 | 100 |
+| Sep 25 | 110 | 80 |"""
+        result = mask_all_chart_values(chart)
+        self.assertIn("| Jul 25 | — | — |", result)
+        self.assertIn("| Sep 25 | — | — |", result)
+
+    def test_native_axis_ticks_cannot_verify_generated_line_values(self):
+        chart = Segment(
+            0, "Chart", (0.1995, 0.2558, 0.8005, 0.7442),
+            """| Kỳ | Chỉ số |
+| :--- | ---: |
+| Jul 25 | 100 |
+| Sep 25 | 80 |""", "focused_chart_spatial",
+        )
+        page = PdfTextPage(1000, 1000, (
+            PdfTextLine((102, 300, 130, 320), "100"),
+            PdfTextLine((102, 500, 125, 520), "80"),
+            PdfTextLine((200, 780, 250, 800), "Jul 25"),
+            PdfTextLine((700, 780, 760, 800), "Sep 25"),
+        ))
+        result = bind_chart_to_native_value_labels(chart, chart, page, "line")
+        self.assertIn("| Jul 25 | — |", result.text)
+        self.assertIn("| Sep 25 | — |", result.text)
+        self.assertTrue(result.source.startswith("uncertain:"))
+
+    def test_raster_profile_plot_cannot_supply_generated_values(self):
+        chart = Segment(
+            0, "Chart", (0.25, 0.25, 0.55, 0.75),
+            """| Kỳ | Cổ phiếu | Chỉ số |
+| :--- | ---: | ---: |
+| Jul 25 | 108,0 | 100,0 |
+| Aug 25 | 112,0 | 101,0 |""",
+            "focused_chart_spatial",
+        )
+        target = Segment(
+            0, "Chart", chart.bbox, "Hiệu suất giá tương đối",
+            "native_profile_geometry",
+        )
+        page = PdfTextPage(1000, 1000, ())
+        result = bind_chart_to_native_value_labels(chart, target, page, "line")
+        self.assertIn("| Jul 25 | — | — |", result.text)
+        self.assertIn("| Aug 25 | — | — |", result.text)
+        self.assertTrue(result.source.startswith("uncertain:"))
+
     def test_accepts_structured_chart(self):
         self.assertEqual([], chart_quality_issues(GOOD_CHART))
 
@@ -164,6 +269,16 @@ class ChartEvidenceTests(unittest.TestCase):
             or "numeric values used as category labels" in issues
         )
 
+    def test_rejects_invented_non_period_labels_for_time_chart(self):
+        chart = """| Kỳ | Giá trị |
+| :--- | ---: |
+| Blue | 42,0 |
+| Orange | 20,8 |"""
+        self.assertIn(
+            "non-period categories in a time chart",
+            chart_quality_issues(chart, "Biên lợi nhuận theo quý 3Q24-2Q26"),
+        )
+
     def test_masks_line_values_not_present_in_direct_ocr(self):
         structured = """| Kỳ | Doanh thu | Biên gộp |
 | :--- | ---: | ---: |
@@ -175,6 +290,48 @@ class ChartEvidenceTests(unittest.TestCase):
         self.assertIn("| 1Q25 | 83,8 | — |", result)
         self.assertIn("| 2Q25 | 46,4 | — |", result)
         self.assertIn("| 3Q25 | 39,1 | -18,6% |", result)
+
+    def test_evidence_bound_fallback_keeps_only_exact_direct_cells(self):
+        generated = Segment(
+            0, "Chart", (0, 0, 1, 1),
+            """| Kỳ | Tổng tài sản | Vốn chủ sở hữu |
+| :--- | ---: | ---: |
+| 2023 | 668 | 148 |
+| 2024 | 837 | 154 |
+| 2025 | 1119 | 151 |
+| 6T26 | 1309 | 181 |""", "pass2",
+        )
+        evidence = Segment(
+            0, "Chart", (0, 0, 1, 1), """| Year | Value |
+| --- | ---: |
+| 2023 | 148 |
+| 2024 | 837 |
+| 2025 | 1.119 |
+| 6T26 | 1.309 |""", "labels"
+        )
+        result = evidence_bound_chart_candidate(
+            generated, evidence, "Tổng tài sản & vốn chủ sở hữu theo năm"
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("| 2023 | — | 148 |", result.text)
+        self.assertIn("| 2024 | 837 | — |", result.text)
+        self.assertIn("| 2025 | 1.119 | — |", result.text)
+        self.assertNotIn("| 2025 | 119 |", result.text)
+
+    def test_evidence_bound_rejects_collapsed_combo_series(self):
+        generated = Segment(
+            0, "Chart", (0, 0, 1, 1),
+            """| Kỳ | Value |
+| :--- | ---: |
+| 1Q26 | 104,4 |
+| 2Q26 | 23,3 |""", "pass2",
+        )
+        evidence = Segment(0, "Chart", (0, 0, 1, 1), "104,4 23,3%", "labels")
+        self.assertIsNone(evidence_bound_chart_candidate(
+            generated, evidence,
+            "Cột = doanh thu · đường = biên gộp, trục phải",
+        ))
 
     def test_value_mask_never_rewrites_numeric_series_headers(self):
         structured = """| Kỳ | Chuỗi 1 | Chuỗi 2 |
@@ -194,6 +351,21 @@ class ChartEvidenceTests(unittest.TestCase):
         )
         self.assertIn("| 1Q25 | 83,8 | — |", result)
         self.assertIn("| 2Q25 | 46,4 | — |", result)
+
+    def test_combo_keeps_bars_but_only_directly_seen_line_labels(self):
+        structured = """| Kỳ | Doanh thu | Tăng trưởng YoY |
+| :--- | ---: | ---: |
+| 1Q25 | 594 | 21,0% |
+| 2Q25 | 633 | 22,4% |
+| 3Q25 | 574 | 5,3% |"""
+        result = mask_combo_line_without_evidence(
+            structured,
+            "Cột: doanh thu · đường: tăng trưởng YoY, trục phải",
+            "21,0% 5,3%",
+        )
+        self.assertIn("| 1Q25 | 594 | 21,0% |", result)
+        self.assertIn("| 2Q25 | 633 | — |", result)
+        self.assertIn("| 3Q25 | 574 | 5,3% |", result)
 
     def test_spatial_time_chart_binds_periods_bars_and_only_labeled_line_points(self):
         labels = []
@@ -271,7 +443,7 @@ class ChartEvidenceTests(unittest.TestCase):
         self.assertIn("| 3Q25 | 39,1 | -18,6% |", result)
         self.assertIn("| 2Q26 | 117,9 | 23,3% |", result)
 
-    def test_category_band_keeps_only_sequential_two_prompt_consensus(self):
+    def test_category_band_uses_adaptive_third_view_to_resolve_disagreement(self):
         image = Image.new("RGB", (1200, 800), "white")
         buffer = BytesIO()
         image.save(buffer, format="PNG")
@@ -298,15 +470,103 @@ class ChartEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(result)
         assert result is not None
         self.assertIn("| 1Q26 | 100 |", result)
-        self.assertIn("| 2Q26 | — |", result)
+        self.assertIn("| 2Q26 | 200 |", result)
         self.assertIn("| 3Q26 | 300 |", result)
         self.assertEqual(
             [
                 "focused_chart_1_band_1.labels", "focused_chart_1_band_1.contrast",
                 "focused_chart_1_band_2.labels", "focused_chart_1_band_2.contrast",
+                "focused_chart_1_band_2.binary",
                 "focused_chart_1_band_3.labels", "focused_chart_1_band_3.contrast",
             ],
             calls,
+        )
+
+    def test_category_band_preserves_dominant_printed_decimal_style(self):
+        image = Image.new("RGB", (1200, 800), "white")
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        categories = ["ETC", "OTC", "Khác"]
+        color = ["371,5 55,8%", "287,7 43.2%", "7,0 1,1%"]
+        processed = ["371.5 55.8%", "287.7 43.2%", "7.0 1.1%"]
+
+        def fake_request_ocr(**kwargs):
+            index = int(kwargs["pass_name"].split("_band_", 1)[1].split(".", 1)[0]) - 1
+            return color[index] if kwargs["prompt"] == "labels" else processed[index]
+
+        with patch("pdf_to_md_vllm.request_ocr", side_effect=fake_request_ocr):
+            labels = read_chart_category_bands(
+                target=Segment(0, "Chart", (0, 0, 1, 1), ""),
+                page_png=buffer.getvalue(), categories=categories,
+                ocr_prompt="labels", verification_prompt="plain",
+                page_no=0, chart_number=1, endpoint="unused", model=".",
+                timeout=1, retries=0, raw_output_dir=None, padding=0,
+            )
+        values = [
+            label.text for label in labels
+            if label.source.startswith("focused_chart_band")
+        ]
+        self.assertEqual(
+            ["371,5", "55,8%", "287,7", "43,2%", "7,0", "1,1%"],
+            values,
+        )
+
+    def test_one_failed_category_does_not_discard_other_band_values(self):
+        image = Image.new("RGB", (1200, 800), "white")
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+
+        def fake_request_ocr(**kwargs):
+            index = int(kwargs["pass_name"].rsplit("_", 1)[1])
+            if index == 2:
+                raise RuntimeError("empty OCR response")
+            return "100" if index == 1 else "300"
+
+        with patch("pdf_to_md_vllm.request_ocr", side_effect=fake_request_ocr):
+            labels = read_chart_category_bands(
+                target=Segment(0, "Chart", (0, 0, 1, 1), ""),
+                page_png=buffer.getvalue(), categories=["1Q26", "2Q26", "3Q26"],
+                ocr_prompt="ocr", page_no=0, chart_number=1,
+                endpoint="unused", model=".", timeout=1, retries=0,
+                raw_output_dir=None, padding=0,
+            )
+        values = [
+            label.text for label in labels
+            if label.source.startswith("focused_chart_band")
+        ]
+        self.assertEqual(["100", "300"], values)
+
+    def test_time_axis_read_recovers_omitted_first_period_without_inference(self):
+        image = Image.new("RGB", (1200, 800), "white")
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        with patch(
+            "pdf_to_md_vllm.request_ocr",
+            return_value="3Q24 4Q24 1Q25 2Q25 3Q25 4Q25 1Q26 2Q26",
+        ):
+            categories = read_chart_time_axis_categories(
+                target=Segment(0, "Chart", (0, 0, 1, 1), ""),
+                page_png=buffer.getvalue(), ocr_prompt="ocr", page_no=0,
+                chart_number=1, endpoint="unused", model=".", timeout=1,
+                retries=0, raw_output_dir=None, padding=0,
+            )
+        self.assertEqual(
+            ["3Q24", "4Q24", "1Q25", "2Q25", "3Q25", "4Q25", "1Q26", "2Q26"],
+            categories,
+        )
+
+    def test_time_category_skeleton_skips_nonperiod_focused_table(self):
+        wrong = Segment(
+            0, "Chart", (0, 0, 1, 1),
+            """| Category | Value |
+| --- | ---: |
+| Blue | 42,0 |
+| Orange | 20,8 |""", "focused_chart",
+        )
+        correct = Segment(1, "Chart", (0, 0, 1, 1), GOOD_CHART, "pass2")
+        self.assertEqual(
+            ["Q1/2026", "Q2/2026"],
+            chart_categories_from_candidates((wrong, correct), periods_only=True),
         )
 
     def test_spatial_categorical_chart_pairs_grouped_values_and_categories(self):
@@ -328,6 +588,42 @@ class ChartEvidenceTests(unittest.TestCase):
         self.assertIn("| Hạng mục | Chuỗi 1 | Chuỗi 2 |", result)
         self.assertIn("| Công nghiệp | 33,0 | 61,4 |", result)
 
+    def test_transposed_period_evidence_becomes_searchable_rows(self):
+        evidence = """| 2Q25 | 3Q25 | 4Q25 | 1Q26 | 2Q26 | |
+| --- | --- | --- | --- | --- | --- |
+| Tăng trưởng YoY | +22,4% | +5,3% | -1,7% | -8,1% | -11,1% |"""
+        chart = transposed_period_chart_ir(evidence, "direct_evidence")
+        self.assertIsNotNone(chart)
+        assert chart is not None
+        rendered = render_chart_ir(chart)
+        self.assertIn("| Kỳ | Giá trị (%) |", rendered)
+        self.assertIn("| 2Q25 | +22,4% |", rendered)
+        self.assertIn("| 2Q26 | -11,1% |", rendered)
+
+    def test_combo_raw_keeps_bars_and_only_direct_line_points(self):
+        generated = Segment(
+            0, "Chart", (0, 0, 1, 1),
+            """| Kỳ | Doanh thu | YoY |
+| --- | ---: | ---: |
+| 1Q25 | 594 | +21,0% |
+| 2Q25 | 633 | +22,4% |
+| 3Q25 | 574 | +5,3% |""", "pass2",
+        )
+        direct = ChartIR(
+            "Kỳ", ("Giá trị (%)",), ("2Q25", "3Q25"),
+            (
+                ChartObservation("2Q25", "Giá trị (%)", "+22,4%", "direct"),
+                ChartObservation("3Q25", "Giá trị (%)", "+5,3%", "direct"),
+            ), "direct",
+        )
+        result = combo_raw_chart_candidate(
+            generated, direct, "Cột doanh thu · đường YoY, trục phải"
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertIn("| 1Q25 | 594 | — |", result.text)
+        self.assertIn("| 2Q25 | 633 | +22,4% |", result.text)
+
     def test_checks_composition_percentage_not_amount_column(self):
         chart = """| Kênh | Doanh thu | Tỷ trọng |
 | :--- | ---: | ---: |
@@ -345,6 +641,107 @@ class ChartEvidenceTests(unittest.TestCase):
         self.assertTrue(chart_reads_agree(GOOD_CHART, second))
         self.assertFalse(chart_reads_agree(GOOD_CHART, very_different))
 
+    def test_incomplete_reads_cannot_confirm_each_other(self):
+        incomplete = """| Kỳ | Giá trị |
+| :--- | ---: |
+| Q1/2026 | 100 |
+| Q2/2026 | — |"""
+        self.assertFalse(chart_reads_agree(incomplete, incomplete))
+
+    def test_time_chart_always_uses_local_category_bands(self):
+        complete = chart_ir_from_markdown(GOOD_CHART, "whole_chart")
+        assert complete is not None
+        self.assertTrue(should_read_chart_category_bands(
+            ["Q1/2026", "Q2/2026"], complete
+        ))
+
+    def test_sparse_band_retry_does_not_erase_stronger_positioned_read(self):
+        original = []
+        retry = []
+        for index, period in enumerate(("2023", "2024", "2025", "6T26")):
+            x = 0.15 + index * 0.22
+            original.extend([
+                Segment(index, "Text", (x, 0.75, x + 0.06, 0.79), period),
+                Segment(index + 10, "Text", (x, 0.45, x + 0.06, 0.49), str(10 + index)),
+            ])
+            retry.append(Segment(index, "Text", (x, 0.75, x + 0.06, 0.79), period))
+            if index < 2:
+                retry.append(Segment(
+                    index + 10, "Text", (x, 0.45, x + 0.06, 0.49), str(10 + index)
+                ))
+        self.assertIs(
+            original,
+            choose_stronger_spatial_labels(original, retry, "theo năm"),
+        )
+
+    def test_sparse_band_retry_does_not_erase_bbox_table_evidence(self):
+        original = [Segment(
+            0, "Chart", (0, 0, 1, 1),
+            """| Kỳ | Giá trị |
+| :--- | ---: |
+| 2023 | 148 |
+| 2024 | 837 |
+| 2025 | 1.119 |
+| 6T26 | 1.309 |""", "focused_chart_label",
+        )]
+        retry = [
+            Segment(0, "Text", (0.1, .8, .2, .85), "2023"),
+            Segment(1, "Text", (0.1, .4, .2, .45), "148"),
+            Segment(2, "Text", (0.4, .8, .5, .85), "2024"),
+            Segment(3, "Text", (0.4, .4, .5, .45), "837"),
+        ]
+        self.assertIs(
+            original,
+            choose_stronger_spatial_labels(original, retry, "theo năm"),
+        )
+
+    def test_period_band_retry_replaces_larger_non_period_ocr_table(self):
+        original = [Segment(
+            0, "Chart", (0, 0, 1, 1),
+            """| Kỳ | Biên gộp | Biên ròng |
+| :--- | ---: | ---: |
+| Blue | 38,3% | 16,9% |
+| Orange | 42,0% | 20,8% |""", "focused_chart_label",
+        )]
+        retry = [
+            Segment(0, "Text", (.1, .8, .2, .85), "3Q24"),
+            Segment(1, "Text", (.1, .4, .2, .45), "38,3%"),
+            Segment(2, "Text", (.1, .5, .2, .55), "16,9%"),
+            Segment(3, "Text", (.8, .8, .9, .85), "2Q26"),
+            Segment(4, "Text", (.8, .4, .9, .45), "42,0%"),
+            Segment(5, "Text", (.8, .5, .9, .55), "20,8%"),
+        ]
+        self.assertIs(
+            retry,
+            choose_stronger_spatial_labels(original, retry, "theo quý"),
+        )
+
+    def test_uncertain_chart_prefers_per_category_consensus_over_pass2_count(self):
+        target = Segment(0, "Chart", (0.1, 0.2, 0.9, 0.6), "", "pass1")
+        pass2_text = """| Kỳ | Giá trị |
+| :--- | ---: |
+| Q1/2026 | 100 |
+| Q2/2026 | 120 |
+| Q3/2026 | 130 |"""
+        consensus_text = """| Kỳ | Giá trị |
+| :--- | ---: |
+| Q1/2026 | 100 |
+| Q2/2026 | 120 |
+| Q3/2026 | — |"""
+        pass2 = Segment(
+            1, "Chart", target.bbox, pass2_text, "pass2",
+        )
+        consensus_ir = chart_ir_from_markdown(consensus_text, "consensus")
+        assert consensus_ir is not None
+        consensus = Segment(
+            2, "Chart", target.bbox, consensus_text,
+            "focused_chart_spatial_consensus", consensus_ir,
+        )
+        result = choose_confirmed_chart(
+            target, pass2, consensus, "", "strict"
+        )
+        self.assertIn("chart_raw_source=focused_chart_spatial_consensus", result.text)
+
     def test_same_number_set_with_swapped_categories_does_not_agree(self):
         first = """| Kỳ | Giá trị |
 | :--- | ---: |
@@ -356,14 +753,15 @@ class ChartEvidenceTests(unittest.TestCase):
 | B | 10 |"""
         self.assertFalse(chart_reads_agree(first, swapped))
 
-    def test_strict_mode_keeps_single_read_as_unconfirmed_raw_data(self):
+    def test_strict_mode_does_not_expose_single_read_generated_table(self):
         target = Segment(0, "Chart", (0.1, 0.2, 0.9, 0.6), GOOD_CHART, "pass1")
         result = choose_confirmed_chart(target, None, None, "Doanh thu", "strict")
         self.assertTrue(result.source.startswith("uncertain:"))
         self.assertIn("Dữ liệu OCR thô", result.text)
-        self.assertIn("| Q1/2026 | 100 |", result.text)
+        self.assertNotIn("| Q1/2026 | 100 |", result.text)
+        self.assertIn("Không đọc được nhãn hoặc số liệu đủ rõ", result.text)
 
-    def test_strict_mode_accepts_agreeing_direct_reads(self):
+    def test_strict_mode_confirms_exact_complete_independent_reads(self):
         target = Segment(0, "Chart", (0.1, 0.2, 0.9, 0.6), GOOD_CHART, "pass1")
         full = Segment(2, "Chart", (0.1, 0.2, 0.9, 0.6), GOOD_CHART, "pass2")
         result = choose_confirmed_chart(target, full, None, "Doanh thu", "strict")
@@ -430,6 +828,15 @@ class GenericRoutingTests(unittest.TestCase):
     def test_decorative_chart_class_without_data_or_caption_is_rejected(self):
         logo = Segment(0, "Chart", (0.7, 0.02, 0.95, 0.10), "CLICK", "pass1")
         targets, _ = chart_target_indexes([logo])
+        self.assertEqual(set(), targets)
+
+    def test_top_logo_does_not_inherit_generic_report_header_as_caption(self):
+        logo = Segment(0, "Chart", (0.05, 0.03, 0.25, 0.10), "CLICK", "pass1")
+        header = Segment(
+            1, "Caption", (0.05, 0.0, 0.45, 0.025),
+            "TECHCOM SECURITIES RESEARCH", "pass1",
+        )
+        targets, _ = chart_target_indexes([logo, header])
         self.assertEqual(set(), targets)
 
     def test_chart_misclassified_as_table_is_detected_from_local_caption(self):
@@ -729,6 +1136,23 @@ class GenericRoutingTests(unittest.TestCase):
         self.assertEqual(["Chart", "Chart"], [segment.cls for segment in result])
         self.assertLess(result[0].bbox[2], result[1].bbox[0])
 
+    def test_dual_chart_axes_are_not_mistaken_for_two_row_table(self):
+        page = PdfTextPage(
+            1000, 600,
+            (
+                PdfTextLine((330, 200, 630, 214), "Yield on Cost & Cost per MW"),
+                PdfTextLine((330, 228, 370, 240), "USD mn"),
+                PdfTextLine((607, 228, 630, 240), "YoC %"),
+                PdfTextLine((334, 245, 343, 255), "20"),
+                PdfTextLine((622, 245, 631, 255), "25"),
+                PdfTextLine((332, 500, 616, 512), "Source: Research company summary"),
+            ),
+            1000, 600,
+        )
+        result, count = infer_native_chart_segments_from_titles([], page)
+        self.assertEqual(1, count)
+        self.assertEqual("Chart", result[0].cls)
+
     def test_does_not_infer_chart_from_full_width_table_source(self):
         page = PdfTextPage(
             1000, 1000,
@@ -776,6 +1200,22 @@ class GenericRoutingTests(unittest.TestCase):
         self.assertEqual(
             ["Doanh thu thuần theo quý", "Tỷ đồng · 8 quý gần nhất"],
             native_chart_caption(chart, page),
+        )
+
+    def test_chart_title_outranks_nearby_short_axis_unit(self):
+        page = PdfTextPage(
+            1000, 1000,
+            (
+                PdfTextLine((100, 100, 700, 120), "Tỷ suất sinh lời trên chi phí theo thị trường"),
+                PdfTextLine((100, 125, 180, 145), "Triệu USD"),
+                PdfTextLine((620, 125, 680, 145), "YoC %"),
+            ),
+            1000, 1000,
+        )
+        chart = Segment(0, "Chart", (0.30, 0.34, 0.70, 0.60), "", "pass1")
+        self.assertEqual(
+            "Tỷ suất sinh lời trên chi phí theo thị trường",
+            native_chart_caption(chart, page)[0],
         )
 
     def test_coalesces_horizontal_metric_cards_from_native_text(self):
@@ -843,6 +1283,7 @@ class PagePipelineTests(unittest.TestCase):
             with (
                 patch("pdf_to_md_vllm.request_ocr", side_effect=reads),
                 patch("pdf_to_md_vllm.read_chart_category_bands", return_value=[]),
+                patch("pdf_to_md_vllm.read_chart_time_axis_categories", return_value=[]),
             ):
                 return process_page(
                     pdf_path=str(pdf_path),
@@ -867,7 +1308,7 @@ class PagePipelineTests(unittest.TestCase):
                     chart_confirmation="strict",
                 )
 
-    def test_end_to_end_page_confirms_two_matching_reads(self):
+    def test_end_to_end_page_confirms_exact_complete_reads(self):
         raw = self.raw_chart(GOOD_CHART)
         result = self.run_page([raw, raw, raw, raw])
         self.assertEqual(1, result.confirmed_charts)
@@ -885,6 +1326,7 @@ class PagePipelineTests(unittest.TestCase):
         self.assertEqual(0, result.confirmed_charts)
         self.assertEqual(1, result.uncertain_charts)
         self.assertIn("Dữ liệu OCR thô", result.markdown)
+        self.assertIn("chart_raw_source=evidence_bound_table", result.markdown)
         self.assertIn("| Q1/2026 | 100 |", result.markdown)
         self.assertNotIn("![", result.markdown)
 

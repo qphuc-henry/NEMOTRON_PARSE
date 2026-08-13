@@ -14,19 +14,23 @@ file, mã doanh nghiệp, số trang hoặc mẫu báo cáo:
    không dùng để tự dựng lại số liệu biểu đồ.
 3. Những vùng `Chart` hoặc `Picture` có tín hiệu biểu đồ được đọc lại ở Pass 2.
 4. Mặc định pipeline OCR toàn trang, sau đó phóng từng vùng biểu đồ trong bộ nhớ.
-   Nếu lượt toàn vùng chưa đủ, từng kỳ được đọc **tuần tự** bằng hai view độc lập:
+   Trục X được OCR riêng trước để không chia sai số lượng kỳ/nhóm khi lượt toàn
+   vùng bỏ mất nhãn đầu hoặc cuối. Sau đó từng kỳ được đọc **tuần tự** bằng hai view độc lập:
    ảnh màu với OCR có bbox và ảnh xám tăng tương phản với OCR thuần. Crop bỏ vùng
    tiêu đề và hạn chế chồng sang cột kế bên. Chỉ số khớp ở đúng kỳ giữa hai view
-   mới vào bảng đồng thuận. Một lượt bbox đơn lẻ không bao giờ tự được đánh dấu
-   `confirmed`.
+   mới vào bảng đồng thuận. Nếu hai view bất đồng, ảnh nhị phân thứ ba được gọi
+   để bỏ phiếu 2/3. Dấu âm, dấu phẩy/chấm, `%` và `x` là một phần của giá trị;
+   `1179` không được coi là giống `117,9`. Một lượt bbox đơn lẻ không bao giờ tự
+   được đánh dấu `confirmed`.
 5. Chỉ số thật sự được in trên biểu đồ mới được ghi. Điểm trên đường không có nhãn
    để đọc sẽ là `—`; pipeline không nội suy hoặc lấy số từ đoạn văn lân cận.
-   Nếu không đủ bằng chứng, output vẫn giữ lượt chép trực tiếp tốt nhất dưới dạng
-   bảng hoặc dữ liệu OCR thô và đánh dấu `uncertain`; code không tính, nội suy,
-   xoay series hay lấy số từ đoạn văn/bảng khác để lấp chỗ trống.
-   Output thô không bị loại chỉ vì model thiếu bbox/class hoặc chưa dựng được
-   bảng. Với PDF có text layer, chữ và số đúng trong bbox biểu đồ cũng được giữ
-   làm fallback để người dùng xem và sửa về sau.
+   Bảng do một lượt OCR toàn biểu đồ sinh ra không được xuất. Hai task/view độc
+   lập chỉ xác nhận khi bảng đầy đủ và khớp chính xác từng địa chỉ ô; một ô lệch
+   cũng không đạt. Với biểu đồ cột–đường, cột số liệu được giữ từ hai lượt khớp,
+   còn điểm đường chỉ được giữ nếu OCR nhãn in trực tiếp nhìn thấy số đó. Nếu
+   không đủ bằng chứng, output đánh dấu `uncertain` và chỉ giữ bảng dựng từ nhãn
+   có tọa độ hoặc text nguyên văn từ bbox PDF làm dữ liệu thô. Code không tính,
+   nội suy, xoay series hay lấy số từ đoạn văn/bảng khác để lấp chỗ trống.
 6. Bảng PDF có text layer được dựng theo tọa độ cột, giữ nguyên ô trống và có thể
    hoàn thiện bảng bị OCR dừng giữa chừng. Bộ gom dừng trước tiêu đề biểu đồ.
    Trang chỉ có text bị cắt giữa chừng sẽ dùng toàn bộ text layer làm fallback.
@@ -47,11 +51,12 @@ flowchart TD
     D --> F[Router vùng có bằng chứng]
     E --> F
     F --> G[OCR crop biểu đồ]
-    G --> H[OCR tuần tự từng kỳ: màu/bbox + tương phản/plain]
-    H --> I[Đồng thuận từng ô]
-    I --> J[ChartIR: category, series, value, source]
+    G --> H[OCR riêng trục X]
+    H --> I[OCR từng kỳ: màu/bbox + tương phản/plain + tie-break khi cần]
+    I --> J[Đồng thuận từng ô]
+    J --> P[ChartIR: category, series, value, source]
     D --> K[Khôi phục prose native]
-    J --> L[Assembler]
+    P --> L[Assembler]
     K --> L
     L --> M{Native text coverage >= 70%?}
     M -->|Không| N[Dừng, không ghi trang thiếu]
@@ -66,7 +71,7 @@ không được tự chọn làm bảng output.
 Output biểu đồ có provenance rõ ràng:
 
 ```markdown
-<!-- chart_region source=pass1+pass2 status=confirmed -->
+<!-- chart_region source=focused_chart_spatial_verified status=confirmed -->
 <!-- chart_region source=uncertain status=uncertain -->
 ```
 
