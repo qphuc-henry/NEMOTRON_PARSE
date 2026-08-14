@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -39,12 +40,15 @@ from pdf_to_md_vllm import (
     mask_all_chart_values,
     mask_combo_line_without_evidence,
     native_chart_caption,
+    native_chart_label_table,
     native_endpoint_time_chart_ir,
+    native_positioned_time_chart_ir,
     native_metric_card_segments,
     native_text_coverage,
     native_wide_table_segments,
     numeric_label_fingerprint,
     parse_segments,
+    pdf_bbox_to_model,
     postprocess_document,
     process_page,
     recover_misclassified_visuals,
@@ -56,6 +60,7 @@ from pdf_to_md_vllm import (
     remove_degenerate_document_lines,
     reconcile_tables_with_text_layer,
     repair_fused_trailing_comparison,
+    restore_richer_original_tables,
     simple_latex_table_to_markdown,
     should_read_chart_category_bands,
     spatial_time_chart_table,
@@ -153,6 +158,10 @@ After"""
         result = remove_degenerate_document_lines(source)
         self.assertEqual("Nội dung gốc", result)
 
+    def test_document_postprocess_drops_single_table_continuation_artifact(self):
+        source = "The table is the same as the page for example in the table.\nNội dung gốc"
+        self.assertEqual("Nội dung gốc", remove_degenerate_document_lines(source))
+
     def test_latex_empty_row_is_removed_after_conversion(self):
         source = r"""\begin{tabular}{ccc}
 **Q1** & **Q2** & **Q3**\\
@@ -179,6 +188,23 @@ After"""
 
 
 class ChartEvidenceTests(unittest.TestCase):
+    def test_native_labels_become_raw_table_without_value_mapping(self):
+        page = PdfTextPage(1000, 1000, (
+            PdfTextLine((100, 100, 500, 120), "Doanh thu theo nhóm"),
+            PdfTextLine((150, 300, 300, 320), "31,1% 24,7%"),
+            PdfTextLine((150, 500, 600, 520), "Xe máy Máy tính Thép cán"),
+        ))
+        target = Segment(
+            0, "Chart", pdf_bbox_to_model((80, 80, 800, 600), page),
+            "Doanh thu theo nhóm", "native_title_geometry",
+        )
+        table = native_chart_label_table(target, page)
+        self.assertIsNotNone(table)
+        assert table is not None
+        self.assertIn("Nhãn số in trên biểu đồ", table)
+        self.assertIn("31,1%; 24,7%", table)
+        self.assertIn("Xe máy Máy tính Thép cán", table)
+
     def test_native_endpoint_labels_make_sparse_time_table(self):
         target = Segment(0, "Chart", (0.1, 0.1, 0.9, 0.9), "", "pass1")
         page = PdfTextPage(1000, 1000, (
@@ -192,6 +218,34 @@ class ChartEvidenceTests(unittest.TestCase):
         rendered = render_chart_ir(chart)
         self.assertIn("| 07/30/2025 | — | — |", rendered)
         self.assertIn("| 07/31/2026 | 16% | -35% |", rendered)
+
+    def test_native_positioned_periods_bind_to_printed_values(self):
+        page = PdfTextPage(
+            1000, 1000,
+            (
+                PdfTextLine((150, 300, 180, 315), "8,6"),
+                PdfTextLine((350, 350, 385, 365), "-0,8"),
+                PdfTextLine((550, 320, 580, 335), "8,5"),
+                PdfTextLine((750, 280, 785, 295), "11,4"),
+                PdfTextLine((80, 420, 120, 435), "2000"),
+                PdfTextLine((150, 500, 190, 515), "2022"),
+                PdfTextLine((350, 500, 390, 515), "2023"),
+                PdfTextLine((550, 500, 590, 515), "2024"),
+                PdfTextLine((750, 500, 790, 515), "2025"),
+            ),
+            1000, 1000,
+        )
+        target = Segment(
+            0, "Chart", pdf_bbox_to_model((100, 100, 900, 600), page),
+            "Tăng trưởng theo năm", "native_title_geometry",
+        )
+        chart = native_positioned_time_chart_ir(target, page)
+        self.assertIsNotNone(chart)
+        assert chart is not None
+        rendered = render_chart_ir(chart)
+        self.assertIn("| 2022 | 8,6 |", rendered)
+        self.assertIn("| 2023 | -0,8 |", rendered)
+        self.assertNotIn("| 2000 |", rendered)
 
     def test_masks_all_values_but_keeps_chart_categories(self):
         chart = """| Kỳ | Chuỗi 1 | Chuỗi 2 |
@@ -742,6 +796,32 @@ class ChartEvidenceTests(unittest.TestCase):
         )
         self.assertIn("chart_raw_source=focused_chart_spatial_consensus", result.text)
 
+    def test_empty_consensus_skeleton_does_not_beat_native_values(self):
+        target = Segment(0, "Chart", (0.1, 0.2, 0.9, 0.6), "", "pass1")
+        skeleton = Segment(
+            1, "Chart", target.bbox,
+            """| Kỳ | Giá trị |
+| :--- | ---: |
+| 2025 | — |
+| 2026 | — |""",
+            "focused_chart_spatial_consensus",
+        )
+        native_text = """| Kỳ | Giá trị |
+| :--- | ---: |
+| 2025 | 3,26% |
+| 2026 | 4,39% |"""
+        native_ir = chart_ir_from_markdown(native_text, "native_positioned_time")
+        assert native_ir is not None
+        native = Segment(
+            2, "Chart", target.bbox, native_text,
+            "native_positioned_time", native_ir,
+        )
+        result = choose_confirmed_chart(
+            target, None, skeleton, "theo năm", "strict", (native,)
+        )
+        self.assertIn("chart_raw_source=native_positioned_time", result.text)
+        self.assertIn("4,39%", result.text)
+
     def test_same_number_set_with_swapped_categories_does_not_agree(self):
         first = """| Kỳ | Giá trị |
 | :--- | ---: |
@@ -1016,6 +1096,46 @@ class GenericRoutingTests(unittest.TestCase):
         self.assertIn("Thu nhập lãi thuần", result[0].text)
         self.assertNotIn("lăi thuãn", result[0].text)
 
+    def test_native_prose_columns_cannot_replace_three_column_table(self):
+        segment = Segment(
+            0, "Table", (0.1, 0.1, 0.9, 0.6),
+            """| Chỉ tiêu | Kết quả | Ghi chú |
+| :--- | ---: | :--- |
+| Bán lẻ | 669 | Nhu cầu cải thiện |""", "pass1",
+        )
+        page = PdfTextPage(
+            1000, 1000,
+            (
+                PdfTextLine((150, 180, 300, 200), "Bán lẻ hàng"),
+                PdfTextLine((550, 180, 850, 200), "trưởng nhờ nhu cầu cải thiện"),
+                PdfTextLine((150, 230, 170, 250), "•"),
+                PdfTextLine((550, 230, 760, 250), "Ước đạt 669 nghìn tỷ đồng"),
+            ),
+            1000, 1000,
+        )
+        result, count = reconcile_tables_with_text_layer([segment], page)
+        self.assertEqual(0, count)
+        self.assertEqual(segment.text, result[0].text)
+
+    def test_partial_table_repair_cannot_drop_original_rows(self):
+        original = Segment(
+            0, "Table", (0.1, 0.1, 0.9, 0.5),
+            """| Chỉ tiêu | Kết quả | Ghi chú |
+| :--- | ---: | :--- |
+| CPI tháng 7 | 4,45% | Giảm theo tháng |
+| CPI bình quân | 4,39% | Trong mục tiêu |""", "pass1",
+        )
+        partial = replace(
+            original,
+            text="""| Chỉ tiêu | Kết quả | Ghi chú |
+| :--- | ---: | :--- |
+| CPI tháng 7 | 4,45% | Giảm theo tháng |""",
+            source="text_layer_table",
+        )
+        result, count = restore_richer_original_tables([partial], [original])
+        self.assertEqual(1, count)
+        self.assertIn("CPI bình quân", result[0].text)
+
     def test_native_wide_table_keeps_empty_cells_and_stops_before_chart(self):
         page = PdfTextPage(
             1000,
@@ -1104,6 +1224,33 @@ class GenericRoutingTests(unittest.TestCase):
         self.assertEqual(1, count)
         self.assertIn("| Lợi nhuận | 10 | 20 | 30 |", repaired)
 
+    def test_document_reconciliation_never_overwrites_chart_table(self):
+        page = PdfTextPage(
+            1000, 1000,
+            (
+                PdfTextLine((100, 100, 300, 120), "Kỳ"),
+                PdfTextLine((400, 100, 470, 120), "Giá trị"),
+                PdfTextLine((100, 125, 300, 145), "2025"),
+                PdfTextLine((400, 125, 470, 145), "3,26%"),
+                PdfTextLine((100, 150, 300, 170), "2026"),
+                PdfTextLine((400, 150, 470, 170), "4,39%"),
+            ),
+        )
+        chart = """<!-- page 1 -->
+
+<!-- chart_region source=uncertain status=uncertain -->
+### Biểu đồ: CPI
+
+| Kỳ | Giá trị |
+| :--- | ---: |
+| 2025 | 3,26% |
+| 2026 | 4,39% |
+"""
+        with patch("pdf_to_md_vllm.extract_pdf_text_page", return_value=page):
+            repaired, count = reconcile_document_tables_with_pdf(chart, "sample.pdf")
+        self.assertEqual(0, count)
+        self.assertEqual(chart, repaired)
+
     def test_text_heavy_infographic_is_not_left_as_chart(self):
         chart = Segment(0, "Chart", (0.1, 0.1, 0.9, 0.7), "ĐIỂM NHẤN", "pass1")
         page = PdfTextPage(
@@ -1134,7 +1281,7 @@ class GenericRoutingTests(unittest.TestCase):
         result, count = infer_native_chart_segments([], page)
         self.assertEqual(2, count)
         self.assertEqual(["Chart", "Chart"], [segment.cls for segment in result])
-        self.assertLess(result[0].bbox[2], result[1].bbox[0])
+        self.assertLessEqual(result[0].bbox[2], result[1].bbox[0])
 
     def test_dual_chart_axes_are_not_mistaken_for_two_row_table(self):
         page = PdfTextPage(
@@ -1145,13 +1292,47 @@ class GenericRoutingTests(unittest.TestCase):
                 PdfTextLine((607, 228, 630, 240), "YoC %"),
                 PdfTextLine((334, 245, 343, 255), "20"),
                 PdfTextLine((622, 245, 631, 255), "25"),
-                PdfTextLine((332, 500, 616, 512), "Source: Research company summary"),
+                PdfTextLine((332, 410, 616, 422), "Source: Research company summary"),
             ),
             1000, 600,
         )
         result, count = infer_native_chart_segments_from_titles([], page)
         self.assertEqual(1, count)
         self.assertEqual("Chart", result[0].cls)
+
+    def test_shared_source_splits_two_chart_title_columns(self):
+        page = PdfTextPage(
+            1000, 1000,
+            (
+                PdfTextLine((100, 350, 400, 364), "Tăng trưởng doanh thu theo năm"),
+                PdfTextLine((600, 352, 900, 366), "Biên lợi nhuận theo năm"),
+                PdfTextLine((120, 430, 160, 444), "2024"),
+                PdfTextLine((250, 430, 290, 444), "2025"),
+                PdfTextLine((620, 430, 660, 444), "2024"),
+                PdfTextLine((760, 430, 800, 444), "2025"),
+                PdfTextLine((430, 550, 570, 562), "Nguồn: Báo cáo công ty"),
+            ),
+            1000, 1000,
+        )
+        result, count = infer_native_chart_segments_from_titles([], page)
+        self.assertEqual(2, count)
+        self.assertLessEqual(result[0].bbox[2], result[1].bbox[0])
+        self.assertIn("Tăng trưởng doanh thu", result[0].text)
+        self.assertIn("Biên lợi nhuận", result[1].text)
+
+    def test_date_and_table_headers_are_not_chart_titles(self):
+        page = PdfTextPage(
+            1000, 1000,
+            (
+                PdfTextLine((350, 200, 650, 214), "Ngày 06 tháng 08 năm 2026"),
+                PdfTextLine((100, 350, 220, 364), "Chỉ tiêu"),
+                PdfTextLine((400, 350, 520, 364), "Kết quả"),
+                PdfTextLine((700, 350, 820, 364), "Ghi chú"),
+                PdfTextLine((430, 550, 570, 562), "Nguồn: Báo cáo công ty"),
+            ),
+            1000, 1000,
+        )
+        self.assertEqual(([], 0), infer_native_chart_segments_from_titles([], page))
 
     def test_does_not_infer_chart_from_full_width_table_source(self):
         page = PdfTextPage(
@@ -1176,6 +1357,26 @@ class GenericRoutingTests(unittest.TestCase):
         self.assertEqual(2, len(segments))
         self.assertIn("Biểu đồ doanh thu", replacements[0].text)
         self.assertNotIn("Biểu đồ lợi nhuận", replacements[0].text)
+
+    def test_native_caption_fills_blank_raw_title_field(self):
+        page = PdfTextPage(
+            1000, 1000,
+            (PdfTextLine((100, 100, 500, 120), "Dự toán ngân sách nhà nước 2026"),),
+            1000, 1000,
+        )
+        chart = Segment(0, "Picture", (0.30, 0.34, 0.65, 0.60), "", "pass1")
+        replacement = Segment(
+            0, "Chart", chart.bbox,
+            "| Trường | Dữ liệu OCR thô |\n| :--- | :--- |\n| Tiêu đề |  |",
+            "uncertain:test",
+        )
+        _, replacements = attach_chart_captions(
+            [chart], {0: replacement}, page
+        )
+        self.assertIn(
+            "| Tiêu đề | Dự toán ngân sách nhà nước 2026 |",
+            replacements[0].text,
+        )
 
     def test_numbered_section_heading_is_not_stolen_as_chart_title(self):
         chart = Segment(0, "Chart", (0.1, 0.3, 0.8, 0.6), "", "pass1")
